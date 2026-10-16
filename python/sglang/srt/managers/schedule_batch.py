@@ -1716,6 +1716,15 @@ class Req(ReqDllmMixin):
                 and not envs.SGLANG_CLEF_SPIKE_DISABLE_BRANCHING.get()
             ):
                 self.mamba_branching_seqlen = clef_boundary
+            if envs.SGLANG_CLEF_SPIKE_LOG.get() and clef_boundary is not None:
+                logger.info(
+                    "CLEF_SPIKE_CACHE rid=%s boundary=%s matched_prefix_len=%s "
+                    "branching_seqlen=%s",
+                    self.rid,
+                    clef_boundary,
+                    self.prefix_len,
+                    self.mamba_branching_seqlen,
+                )
             if match_result.cache_protected_len is None:
                 self.kv.cache_protected_len = self.prefix_len
 
