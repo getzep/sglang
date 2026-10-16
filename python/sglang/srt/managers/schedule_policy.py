@@ -343,12 +343,15 @@ class SchedulePolicy:
         self, waiting_queue: List[Req], policy: CacheAwarePolicy
     ) -> Set[int]:
         temporary_deprioritized: Set[int] = set()
+        clef_trace = envs.SGLANG_CLEF_SPIKE_LOG.get()
+        clef_matches = []
         self.waiting_queue_radix_tree.reset()
 
         for r in waiting_queue:
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
             cache_salt = r.cache_salt
+            waiting_tree_match_len = None
             clef_boundary = r._clef_cache_boundary()
             if clef_boundary is None:
                 match_result = match_kv_cache(r, self.tree_cache, prefix_ids)
@@ -369,7 +372,7 @@ class SchedulePolicy:
             # threshold means we cannot use in-batch prefix caching for short prefixes.
             # It is kind of common when the engine is long running (e.g., imagine the prefix "the").
             if r.prefix_len <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
-                match_result = self.waiting_queue_radix_tree.match_prefix(
+                waiting_tree_match = self.waiting_queue_radix_tree.match_prefix(
                     MatchPrefixParams(
                         key=RadixKey(
                             token_ids=(
@@ -382,6 +385,8 @@ class SchedulePolicy:
                         )
                     )
                 )
+                waiting_tree_match_len = waiting_tree_match.device_prefix_len
+                match_result = waiting_tree_match
                 if envs.SGLANG_RADIX_FORCE_MISS.get():
                     match_result = zero_match_result(
                         self.waiting_queue_radix_tree, match_result, extra_key=extra_key
@@ -403,6 +408,23 @@ class SchedulePolicy:
                             value=torch.empty(len(prefix_ids), dtype=torch.bool),
                         )
                     )
+            if clef_trace and r.decision_layout is not None:
+                clef_matches.append(
+                    {
+                        "rid": r.rid,
+                        "tree_prefix_len": r.prefix_len,
+                        "waiting_tree_match_len": waiting_tree_match_len,
+                        "temporary_deprioritized": r.rid
+                        in temporary_deprioritized,
+                    }
+                )
+        if clef_trace:
+            logger.info(
+                "CLEF_SPIKE_LPM policy=%s waiting_queue_len=%d clef_reqs=%s",
+                policy.value,
+                len(waiting_queue),
+                clef_matches,
+            )
         return temporary_deprioritized
 
     @staticmethod
@@ -1172,6 +1194,7 @@ class PrefillAdder:
             raise RuntimeError("chunked request exceeds the sharded assembly scratch")
         req.extend_end = req.prefix_len + new_len
         self.can_run_list.append(req)
+        self._log_clef_admission(req, req.prefix_len, chunked=True)
         self._update_prefill_budget(
             0,
             req.extend_len,
@@ -1623,6 +1646,9 @@ class PrefillAdder:
         req.extend_end = admission.prefix_len + admission.extend_len
         req.lock = self.tree_cache.lock(req.last_node)
         self.can_run_list.append(req)
+        self._log_clef_admission(
+            req, admission.prefix_len, chunked=admission.is_chunked
+        )
         if admission.is_chunked:
             self.new_chunked_req = req
         self._update_prefill_budget(
@@ -1638,6 +1664,19 @@ class PrefillAdder:
             compute_charge=admission.extend_len if self.exact_chunk_fill else None,
         )
         self._account_prefill_cache_admission(req, admission.prefix_len)
+
+    @staticmethod
+    def _log_clef_admission(req: Req, prefix_len: int, *, chunked: bool) -> None:
+        if (
+            envs.SGLANG_CLEF_SPIKE_LOG.get()
+            and req.decision_layout is not None
+        ):
+            logger.info(
+                "CLEF_SPIKE_ADMISSION rid=%s prefix_len=%d chunked=%s",
+                req.rid,
+                prefix_len,
+                chunked,
+            )
 
     def preempt_to_schedule(self, req: Req) -> bool:
         """
