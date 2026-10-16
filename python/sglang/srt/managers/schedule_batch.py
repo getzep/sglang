@@ -1710,7 +1710,11 @@ class Req(ReqDllmMixin):
             )
             self.mamba_branching_seqlen = match_result.mamba_branching_seqlen
             clef_boundary = self._clef_cache_boundary()
-            if clef_boundary is not None and clef_boundary > self.prefix_len:
+            if (
+                clef_boundary is not None
+                and clef_boundary > self.prefix_len
+                and not envs.SGLANG_CLEF_SPIKE_DISABLE_BRANCHING.get()
+            ):
                 self.mamba_branching_seqlen = clef_boundary
             if match_result.cache_protected_len is None:
                 self.kv.cache_protected_len = self.prefix_len
