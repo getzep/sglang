@@ -122,6 +122,88 @@ class TestJointSchemaPooler(CustomTestCase):
         self.assertEqual([len(scores) for scores in output.embeddings], [5, 0, 5])
         self.assertEqual(head.calls, [[40], [40]])
 
+    def test_a_span_before_one_prefix_skips_only_that_request(self):
+        class FakePool:
+            def __init__(self):
+                self.rows = torch.zeros(512, 2)
+
+            def store_clef_memory(self, locations, rows):
+                self.rows[locations] = rows
+
+            def gather_clef_memory(self, locations):
+                return self.rows[locations]
+
+        torch.manual_seed(23)
+        head = _RecordingHead()
+        pool = FakePool()
+        pooler = JointSchemaPooler(head, lambda: torch.zeros(64, 2))
+        full_hidden = [torch.randn(40, 4) for _ in range(3)]
+        full_ids = [torch.zeros(40, dtype=torch.long) for _ in range(3)]
+        prefixes = [0, 12, 4]
+        lengths = [40 - prefix for prefix in prefixes]
+        layout = pack_decision_layout(40, _questions())
+
+        prefix_locations = torch.arange(120, 124)
+        pool.store_clef_memory(
+            prefix_locations, head.project_memory(full_hidden[2][:4])
+        )
+        req_to_token = torch.zeros((3, 40), dtype=torch.long)
+        req_to_token[2, :4] = prefix_locations
+        extend_hidden = torch.cat(
+            [hidden[prefix:] for hidden, prefix in zip(full_hidden, prefixes)]
+        )
+        extend_ids = torch.cat(
+            [ids[prefix:] for ids, prefix in zip(full_ids, prefixes)]
+        )
+        forward_batch = SimpleNamespace(
+            clef_prefix_cache=True,
+            token_to_kv_pool=pool,
+            req_to_token=req_to_token,
+            req_pool_indices=torch.arange(3),
+            out_cache_loc=torch.arange(sum(lengths)),
+            decision_layouts=[layout, layout, layout],
+            extend_seq_lens_cpu=lengths,
+            extend_prefix_lens_cpu=prefixes,
+            clef_cache_boundaries=[16, 16, 16],
+            batch_size=3,
+            input_ids=extend_ids,
+            rids=["no-prefix", "bad-span", "valid-prefix"],
+        )
+
+        with self.assertLogs(
+            "sglang.srt.layers.joint_schema_head", level="WARNING"
+        ) as warnings:
+            mixed = pooler(extend_hidden, forward_batch)
+        self.assertEqual(len(warnings.output), 1)
+        self.assertIn("bad-span", warnings.output[0])
+        self.assertIn("prefix length 12", warnings.output[0])
+        self.assertIn("decision span start 10", warnings.output[0])
+        self.assertEqual(mixed.embeddings[1].numel(), 0)
+        self.assertEqual(head.calls[:2], [[40], [36]])
+
+        def run_alone(index):
+            prefix = prefixes[index]
+            length = lengths[index]
+            start = 300 + index * 40
+            single_batch = SimpleNamespace(
+                clef_prefix_cache=True,
+                token_to_kv_pool=pool,
+                req_to_token=req_to_token,
+                req_pool_indices=torch.tensor([index]),
+                out_cache_loc=torch.arange(start, start + length),
+                decision_layouts=[layout],
+                extend_seq_lens_cpu=[length],
+                extend_prefix_lens_cpu=[prefix],
+                clef_cache_boundaries=[16],
+                batch_size=1,
+                input_ids=full_ids[index][prefix:],
+                rids=[forward_batch.rids[index]],
+            )
+            return pooler(full_hidden[index][prefix:], single_batch).embeddings[0]
+
+        self.assertTrue(torch.equal(mixed.embeddings[0], run_alone(0)))
+        self.assertTrue(torch.equal(mixed.embeddings[2], run_alone(2)))
+
 
 def _reference_logits(head, hidden, input_ids, questions, lm_head):
     """One request through the modules' own forward methods, as the checkpoint's loop does."""
@@ -426,7 +508,7 @@ class TestJointSchemaHeadPrefixMemory(CustomTestCase):
         self.assertEqual(len(head.prefix_memory), 1)
         self.assertTrue(torch.equal(head.prefix_memory[0][0], second_rows[:2]))
 
-    def test_t5_boundary_alignment_and_partial_span_error(self):
+    def test_t5_boundary_alignment_and_partial_span_skip(self):
         layout = pack_decision_layout(100, [LayoutQuestion(0, (20, 22), ((25, 27),))])
         self.assertEqual(compute_clef_cache_boundary(layout, 100, 4, 8), 16)
         self.assertEqual(compute_clef_cache_boundary(layout, 110, 4, 8), 24)
@@ -451,14 +533,14 @@ class TestJointSchemaHeadPrefixMemory(CustomTestCase):
             req_to_token=torch.zeros((1, 5), dtype=torch.long),
             rids=["partial"],
         )
-        with self.assertRaisesRegex(ValueError, "before prefix"):
-            pooler(torch.randn(2, 2), forward_batch)
+        output = pooler(torch.randn(2, 2), forward_batch)
+        self.assertEqual(output.embeddings[0].numel(), 0)
         forward_batch.decision_layouts = [
             pack_decision_layout(5, [LayoutQuestion(0, (3, 4), ((4, 5),))])
         ]
         forward_batch.clef_cache_boundaries = [2]
-        with self.assertRaisesRegex(ValueError, "beyond cache boundary"):
-            pooler(torch.randn(2, 2), forward_batch)
+        output = pooler(torch.randn(2, 2), forward_batch)
+        self.assertEqual(output.embeddings[0].numel(), 0)
 
     def test_t6_unquantized_lm_head_methods_pass(self):
         validate_clef_lm_head(

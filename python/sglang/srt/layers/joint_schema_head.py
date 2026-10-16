@@ -15,6 +15,7 @@ more than its memory projection.
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import Callable, List, Optional, Sequence, Tuple
 
@@ -24,6 +25,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
+
+logger = logging.getLogger(__name__)
 
 # Question types in the order of the head's type embedding.
 QUESTION_TYPES = ("noul", "choice", "score")
@@ -634,26 +637,34 @@ class JointSchemaPooler(nn.Module):
                     else i
                 )
                 if boundary is None or prefix > boundary:
-                    raise ValueError(
-                        f"Clef request {rid} has prefix length {prefix} beyond "
-                        f"cache boundary {boundary}"
+                    logger.warning(
+                        "Skipping Clef request %s with prefix length %s and "
+                        "cache boundary %s",
+                        rid,
+                        prefix,
+                        boundary,
                     )
+                    continue
                 try:
                     questions = parse_decision_layout(layout, prefix + length)
                 except ValueError:
                     continue
-                if any(
-                    start < prefix
+                span_starts = [question.question_span[0] for question in questions]
+                span_starts.extend(
+                    start
                     for question in questions
-                    for start in (
-                        question.question_span[0],
-                        *(span[0] for span in question.option_spans),
+                    for start, _ in question.option_spans
+                )
+                first_span_start = min(span_starts)
+                if first_span_start < prefix:
+                    logger.warning(
+                        "Skipping Clef request %s with prefix length %s and "
+                        "decision span start %s",
+                        rid,
+                        prefix,
+                        first_span_start,
                     )
-                ):
-                    raise ValueError(
-                        f"Clef request {rid} has a decision span before prefix "
-                        f"length {prefix}"
-                    )
+                    continue
                 layouts[i] = [
                     LayoutQuestion(
                         question.question_type,
