@@ -1772,7 +1772,7 @@ class Req(ReqDllmMixin):
         return compute_clef_cache_boundary(
             self.decision_layout,
             len(self.origin_input_ids),
-            get_memory().page_size or 1,
+            get_schedule().page_size or 1,
             mamba_cache_chunk_size(),
         )
 
