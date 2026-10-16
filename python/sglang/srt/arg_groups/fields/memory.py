@@ -68,6 +68,13 @@ class Memory(msgspec.Struct):
             resolvable=True,
         ),
     ] = False
+    clef_prefix_cache: A[
+        bool,
+        Arg(
+            help="Cache Clef memory rows with the KV pool for prefix reuse.",
+            resolvable=True,
+        ),
+    ] = False
     enable_page_major_kv_layout: A[
         bool,
         "Store the Mamba state and full/SWA KV caches as one entry per token "

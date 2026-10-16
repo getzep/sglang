@@ -2357,6 +2357,17 @@ class KVCacheConfigurator:
         if qsa_profile is None:
             pool_class = HybridLinearKVPool
             extra_args["use_mla"] = self.use_mla_backend
+            if (
+                get_memory().clef_prefix_cache
+                and self.model_config.joint_head_config is not None
+            ):
+                from sglang.srt.mem_cache.clef import ClefHybridLinearKVPool
+
+                pool_class = ClefHybridLinearKVPool
+                extra_args.update(
+                    clef_width=self.model_config.joint_head_config["width"],
+                    clef_dtype=self.model_config.dtype,
+                )
         else:
             pool_class = QSATokenToKVPool
             extra_args.update(

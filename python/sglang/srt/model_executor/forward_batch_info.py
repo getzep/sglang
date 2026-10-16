@@ -32,7 +32,7 @@ import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import lru_cache, total_ordering
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -617,6 +617,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # Joint schema head decision layouts (one per request, None if absent)
     decision_layouts: Optional[List[Optional[List[int]]]] = None
+    # Clef prefix-memory cache inputs, present only when the side buffer is active.
+    clef_prefix_cache: bool = False
+    clef_cache_boundaries: Optional[List[Optional[int]]] = None
+    req_to_token: Optional[torch.Tensor] = None
+    token_to_kv_pool: Optional[Any] = None
 
     # === Borrowed from ScheduleBatch: compound (carry their own device tensors) ===
     # Sampling info
@@ -1088,6 +1093,24 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
+            clef_prefix_cache=hasattr(
+                getattr(model_runner, "token_to_kv_pool", None),
+                "store_clef_memory",
+            ),
+            clef_cache_boundaries=(
+                [req._clef_cache_boundary() for req in batch.reqs]
+                if hasattr(
+                    getattr(model_runner, "token_to_kv_pool", None),
+                    "store_clef_memory",
+                )
+                else None
+            ),
+            req_to_token=(
+                batch.req_to_token_pool.req_to_token
+                if batch.req_to_token_pool is not None
+                else None
+            ),
+            token_to_kv_pool=getattr(model_runner, "token_to_kv_pool", None),
         )
 
         # ScheduleBatch and req_to_token keep allocator-global slot identities,

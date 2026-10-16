@@ -12,8 +12,15 @@ from sglang.srt.layers.joint_schema_head import (
     JointSchemaHead,
     JointSchemaPooler,
     LayoutQuestion,
+    _groups,
+    compute_clef_cache_boundary,
     pack_decision_layout,
     parse_decision_layout,
+    validate_clef_lm_head,
+)
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedEmbeddingMethod,
+    UnquantizedLinearMethod,
 )
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -73,9 +80,23 @@ class _RecordingHead:
 
     def __init__(self):
         self.calls = []
+        self.prefix_memory = []
 
-    def forward_batch(self, hidden, input_ids, lengths, layouts, embedding_weight):
+    def project_memory(self, hidden):
+        return hidden[:, :2]
+
+    def forward_batch(
+        self,
+        hidden,
+        input_ids,
+        lengths,
+        layouts,
+        embedding_weight,
+        prefix_memory=None,
+        extend_memory=None,
+    ):
         self.calls.append(lengths)
+        self.prefix_memory.append(prefix_memory)
         return [
             torch.full((sum(len(q.option_spans) for q in layout),), float(length))
             for length, layout in zip(lengths, layouts)
@@ -180,6 +201,289 @@ def _reference_logits(head, hidden, input_ids, questions, lm_head):
             + torch.sigmoid(head.residual_gate) * (joint_scale * cosine + residual)
         )
     return torch.cat(logits).float()
+
+
+def _shift_layout(questions, prefix):
+    return [
+        LayoutQuestion(
+            question.question_type,
+            (
+                question.question_span[0] - prefix,
+                question.question_span[1] - prefix,
+            ),
+            tuple(
+                (start - prefix, end - prefix) for start, end in question.option_spans
+            ),
+        )
+        for question in questions
+    ]
+
+
+def _origin_main_forward_batch(head, hidden, input_ids, lengths, layouts, lm_head):
+    outputs = []
+    start = 0
+    for group in _groups(lengths, layouts):
+        group_lengths = [lengths[i] for i in group]
+        end = start + sum(group_lengths)
+        outputs += head._forward_group(
+            hidden[start:end],
+            input_ids[start:end],
+            group_lengths,
+            [layouts[i] for i in group],
+            lm_head,
+        )
+        start = end
+    return outputs
+
+
+class TestJointSchemaHeadPrefixMemory(CustomTestCase):
+    def test_t1_split_prefix_matches_full_path(self):
+        torch.manual_seed(13)
+        hidden_size, vocab, length, boundary = 16, 64, 40, 8
+        questions = _questions()
+        layout = pack_decision_layout(length, questions)
+        hidden = torch.randn(length, hidden_size)
+        input_ids = torch.randint(vocab, (length,))
+        lm_head = torch.randn(vocab, hidden_size)
+        head = JointSchemaHead(
+            hidden_size, width=8, routing_layers=1, layers=1, heads=2, feedforward=16
+        ).eval()
+
+        with torch.no_grad():
+            full = head.forward_batch(
+                hidden, input_ids, [length], [questions], lm_head
+            )[0]
+            prefix_memory = head.project_memory(hidden[:boundary])
+            split = head.forward_batch(
+                hidden[boundary:],
+                input_ids[boundary:],
+                [length - boundary],
+                [_shift_layout(questions, boundary)],
+                lm_head,
+                prefix_memory=[prefix_memory],
+            )[0]
+        torch.testing.assert_close(full, split, atol=1e-5, rtol=0)
+
+        bf16_head = head.to(torch.bfloat16)
+        bf16_hidden = hidden.to(torch.bfloat16)
+        bf16_lm_head = lm_head.to(torch.bfloat16)
+        with torch.no_grad():
+            bf16_full = bf16_head.forward_batch(
+                bf16_hidden,
+                input_ids,
+                [length],
+                [parse_decision_layout(layout, length)],
+                bf16_lm_head,
+            )[0]
+            bf16_prefix = bf16_head.project_memory(bf16_hidden[:boundary])
+            bf16_split = bf16_head.forward_batch(
+                bf16_hidden[boundary:],
+                input_ids[boundary:],
+                [length - boundary],
+                [_shift_layout(questions, boundary)],
+                bf16_lm_head,
+                prefix_memory=[bf16_prefix],
+            )[0]
+        max_abs_diff = (bf16_full.float() - bf16_split.float()).abs().max().item()
+        print(f"T1 BF16 maximum absolute difference: {max_abs_diff:.8g}")
+        self.assertLess(max_abs_diff, 1e-2)
+
+    def test_t2_mixed_prefix_batch_matches_full_requests(self):
+        torch.manual_seed(17)
+        hidden_size, vocab, length = 16, 64, 40
+        head = JointSchemaHead(
+            hidden_size, width=8, routing_layers=1, layers=1, heads=2, feedforward=16
+        ).eval()
+        lm_head = torch.randn(vocab, hidden_size)
+        full_hidden = [torch.randn(length, hidden_size) for _ in range(3)]
+        full_ids = [torch.randint(vocab, (length,)) for _ in range(3)]
+        questions = [_questions() for _ in range(3)]
+        boundaries = [0, 5, 8]
+
+        with torch.no_grad():
+            expected = [
+                head.forward_batch(h, ids, [length], [layout], lm_head)[0]
+                for h, ids, layout in zip(full_hidden, full_ids, questions)
+            ]
+            extended_hidden = torch.cat(
+                [full_hidden[i][boundaries[i] :] for i in range(3)]
+            )
+            extended_ids = torch.cat([full_ids[i][boundaries[i] :] for i in range(3)])
+            prefix_memory = [
+                None if boundary == 0 else head.project_memory(hidden[:boundary])
+                for hidden, boundary in zip(full_hidden, boundaries)
+            ]
+            actual = head.forward_batch(
+                extended_hidden,
+                extended_ids,
+                [length - boundary for boundary in boundaries],
+                [
+                    _shift_layout(layout, boundary)
+                    for layout, boundary in zip(questions, boundaries)
+                ],
+                lm_head,
+                prefix_memory=prefix_memory,
+            )
+        for expected_logits, actual_logits in zip(expected, actual):
+            torch.testing.assert_close(
+                actual_logits, expected_logits, atol=1e-5, rtol=0
+            )
+
+    def test_t3_no_prefix_is_equal_to_origin_main_forward_batch(self):
+        torch.manual_seed(19)
+        hidden_size, vocab = 16, 64
+        head = JointSchemaHead(
+            hidden_size, width=8, routing_layers=1, layers=1, heads=2, feedforward=16
+        ).eval()
+        lengths = [40, 32]
+        layouts = [_questions(), _questions()]
+        hidden = torch.randn(sum(lengths), hidden_size)
+        input_ids = torch.randint(vocab, (sum(lengths),))
+        lm_head = torch.randn(vocab, hidden_size)
+        with torch.no_grad():
+            actual = head.forward_batch(hidden, input_ids, lengths, layouts, lm_head)
+            expected = _origin_main_forward_batch(
+                head, hidden, input_ids, lengths, layouts, lm_head
+            )
+        for actual_logits, expected_logits in zip(actual, expected):
+            self.assertTrue(torch.equal(actual_logits, expected_logits))
+
+    def test_t4_stores_rows_and_reuses_slots_without_stale_memory(self):
+        class FakePool:
+            def __init__(self):
+                self.rows = torch.zeros(32, 2)
+
+            def store_clef_memory(self, locations, rows):
+                self.rows[locations] = rows
+
+            def gather_clef_memory(self, locations):
+                return self.rows[locations]
+
+        pool = FakePool()
+        head = _RecordingHead()
+        pooler = JointSchemaPooler(head, lambda: torch.zeros(64, 2))
+        req_to_token = torch.zeros((2, 8), dtype=torch.long)
+        req_to_token[0, :3] = torch.tensor([8, 9, 10])
+        req_to_token[1, :3] = torch.tensor([8, 9, 10])
+
+        def batch(*, slot, hidden, locations, layout, prefix, boundary):
+            return SimpleNamespace(
+                clef_prefix_cache=True,
+                token_to_kv_pool=pool,
+                req_to_token=req_to_token,
+                req_pool_indices=torch.tensor([slot]),
+                out_cache_loc=torch.tensor(locations),
+                decision_layouts=[layout],
+                extend_seq_lens_cpu=[hidden.shape[0]],
+                extend_prefix_lens_cpu=[prefix],
+                clef_cache_boundaries=[boundary],
+                batch_size=1,
+                input_ids=torch.zeros(hidden.shape[0], dtype=torch.long),
+                rids=[f"request-{slot}"],
+            )
+
+        first_rows = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+        pooler(
+            first_rows,
+            batch(
+                slot=0,
+                hidden=first_rows,
+                locations=[8, 9, 10],
+                layout=None,
+                prefix=0,
+                boundary=None,
+            ),
+        )
+        self.assertTrue(torch.equal(pool.rows[8:11], first_rows))
+
+        second_rows = torch.tensor([[11.0, 12.0], [13.0, 14.0], [15.0, 16.0]])
+        pooler(
+            second_rows,
+            batch(
+                slot=1,
+                hidden=second_rows,
+                locations=[8, 9, 10],
+                layout=None,
+                prefix=0,
+                boundary=None,
+            ),
+        )
+        self.assertTrue(torch.equal(pool.rows[8:11], second_rows))
+
+        layout = pack_decision_layout(5, [LayoutQuestion(0, (2, 3), ((3, 4),))])
+        extension = torch.tensor([[20.0, 21.0], [22.0, 23.0], [24.0, 25.0]])
+        pooler(
+            extension,
+            batch(
+                slot=1,
+                hidden=extension,
+                locations=[12, 13, 14],
+                layout=layout,
+                prefix=2,
+                boundary=2,
+            ),
+        )
+        self.assertEqual(len(head.prefix_memory), 1)
+        self.assertTrue(torch.equal(head.prefix_memory[0][0], second_rows[:2]))
+
+    def test_t5_boundary_alignment_and_partial_span_error(self):
+        layout = pack_decision_layout(100, [LayoutQuestion(0, (20, 22), ((25, 27),))])
+        self.assertEqual(compute_clef_cache_boundary(layout, 100, 4, 8), 16)
+        self.assertEqual(compute_clef_cache_boundary(layout, 110, 4, 8), 24)
+
+        pool = SimpleNamespace(
+            store_clef_memory=lambda locations, rows: None,
+            gather_clef_memory=lambda locations: torch.zeros(len(locations), 2),
+        )
+        pooler = JointSchemaPooler(_RecordingHead(), lambda: torch.zeros(64, 2))
+        partial_layout = pack_decision_layout(5, [LayoutQuestion(0, (2, 3), ((3, 4),))])
+        forward_batch = SimpleNamespace(
+            clef_prefix_cache=True,
+            token_to_kv_pool=pool,
+            out_cache_loc=torch.tensor([4, 5]),
+            decision_layouts=[partial_layout],
+            extend_seq_lens_cpu=[2],
+            extend_prefix_lens_cpu=[3],
+            clef_cache_boundaries=[3],
+            batch_size=1,
+            input_ids=torch.zeros(2, dtype=torch.long),
+            req_pool_indices=torch.tensor([0]),
+            req_to_token=torch.zeros((1, 5), dtype=torch.long),
+            rids=["partial"],
+        )
+        with self.assertRaisesRegex(ValueError, "before prefix"):
+            pooler(torch.randn(2, 2), forward_batch)
+        forward_batch.decision_layouts = [
+            pack_decision_layout(5, [LayoutQuestion(0, (3, 4), ((4, 5),))])
+        ]
+        forward_batch.clef_cache_boundaries = [2]
+        with self.assertRaisesRegex(ValueError, "beyond cache boundary"):
+            pooler(torch.randn(2, 2), forward_batch)
+
+    def test_t6_unquantized_lm_head_methods_pass(self):
+        validate_clef_lm_head(
+            SimpleNamespace(
+                quant_method=UnquantizedEmbeddingMethod(),
+                weight=torch.empty(1, dtype=torch.bfloat16),
+            )
+        )
+        validate_clef_lm_head(
+            SimpleNamespace(
+                quant_method=UnquantizedLinearMethod(),
+                weight=torch.empty(1, dtype=torch.bfloat16),
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "unquantized"):
+            validate_clef_lm_head(
+                SimpleNamespace(quant_method=object(), weight=torch.empty(1))
+            )
+        with self.assertRaisesRegex(ValueError, "floating-point"):
+            validate_clef_lm_head(
+                SimpleNamespace(
+                    quant_method=UnquantizedEmbeddingMethod(),
+                    weight=torch.empty(1, dtype=torch.int32),
+                )
+            )
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "the batched head uses FlashAttention")

@@ -975,23 +975,43 @@ def handle_model_capability_adjustments(server_args: Any):
             "prefill; using breakable CUDA graph for CUDA prefill."
         )
 
-    # A Clef checkpoint's joint schema head reads the final hidden state of
-    # every prompt token in one pass, so each request is one complete prefill
-    # with no decode: embedding mode, without prefix reuse or chunking. This
-    # also puts the FA backend on its raw K/V path, which skips the KV pool.
+    # A Clef checkpoint's joint schema head reads every prompt token in one
+    # pass. Each request uses embedding mode and one complete prefill.
     if model_config.joint_head_config is not None:
         if cfg.tp_size != 1 or cfg.pp_size != 1:
             raise ValueError(
                 "Clef checkpoints are served with --tp-size 1 and --pp-size 1, "
                 "since the joint schema head reads full LM head rows"
             )
-        for key, value in (
-            ("is_embedding", True),
-            ("disable_radix_cache", True),
-            ("chunked_prefill_size", -1),
-        ):
-            declare_resolution(
-                server_args, "_handle_model_capability_adjustments", **{key: value}
+        if cfg.clef_prefix_cache:
+            for key, value in (
+                ("is_embedding", True),
+                ("chunked_prefill_size", -1),
+                ("disable_radix_cache", False),
+                ("mamba_radix_cache_strategy", "extra_buffer"),
+                ("disable_overlap_schedule", True),
+            ):
+                declare_resolution(
+                    server_args, "_handle_model_capability_adjustments", **{key: value}
+                )
+            logger.info(
+                "Clef prefix cache enabled: using embedding mode, Mamba extra-buffer "
+                "checkpoints, and disabled overlap scheduling."
+            )
+        else:
+            for key, value in (
+                ("is_embedding", True),
+                ("disable_radix_cache", True),
+                ("chunked_prefill_size", -1),
+            ):
+                declare_resolution(
+                    server_args,
+                    "_handle_model_capability_adjustments",
+                    **{key: value},
+                )
+            logger.info(
+                "Clef prefix cache disabled: using embedding mode without radix "
+                "cache or chunked prefill."
             )
         for phase in (Phase.DECODE, Phase.PREFILL):
             declare_resolution(
@@ -1001,11 +1021,6 @@ def handle_model_capability_adjustments(server_args: Any):
                     cfg.cuda_graph_config, phase, backend=Backend.DISABLED
                 ),
             )
-        logger.info(
-            "Clef joint schema head detected: serving /v1/systemone decisions in "
-            "embedding mode without radix cache, chunked prefill, or CUDA graphs."
-        )
-
     if (
         model_config.is_multimodal
         and not model_config.is_multimodal_chunked_prefill_supported

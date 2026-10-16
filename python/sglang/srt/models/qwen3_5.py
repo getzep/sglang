@@ -58,7 +58,11 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
-from sglang.srt.layers.joint_schema_head import JointSchemaHead, JointSchemaPooler
+from sglang.srt.layers.joint_schema_head import (
+    JointSchemaHead,
+    JointSchemaPooler,
+    validate_clef_lm_head,
+)
 from sglang.srt.layers.layer_boundary import (
     append_stages,
     declare_attn,
@@ -2372,6 +2376,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             model = get_model()
             joint_head_config = load_joint_head_config(model.model_path, model.revision)
             if joint_head_config is not None:
+                validate_clef_lm_head(self.lm_head)
                 # A Clef checkpoint, whose joint schema head scores every option
                 # of every question from the final hidden states and LM head rows.
                 self.pooler = JointSchemaPooler(

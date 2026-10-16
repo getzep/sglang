@@ -5,6 +5,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
+    get_memory,
     get_parallel,
     get_schedule,
     get_serving,
@@ -1708,6 +1709,9 @@ class Req(ReqDllmMixin):
                 max_prefix_len=key_limit,
             )
             self.mamba_branching_seqlen = match_result.mamba_branching_seqlen
+            clef_boundary = self._clef_cache_boundary()
+            if clef_boundary is not None and clef_boundary > self.prefix_len:
+                self.mamba_branching_seqlen = clef_boundary
             if match_result.cache_protected_len is None:
                 self.kv.cache_protected_len = self.prefix_len
 
@@ -1732,6 +1736,9 @@ class Req(ReqDllmMixin):
     def _compute_max_prefix_len(self, input_len: int) -> int:
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
         max_prefix_len = input_len - 1
+        clef_boundary = self._clef_cache_boundary()
+        if clef_boundary is not None:
+            max_prefix_len = min(max_prefix_len, clef_boundary)
         if (
             self.dllm_config is not None
             and self.dllm_config.requires_separate_context_encoding
@@ -1740,6 +1747,18 @@ class Req(ReqDllmMixin):
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
         return max(max_prefix_len, 0)
+
+    def _clef_cache_boundary(self) -> Optional[int]:
+        if self.decision_layout is None or not get_memory().clef_prefix_cache:
+            return None
+        from sglang.srt.layers.joint_schema_head import compute_clef_cache_boundary
+
+        return compute_clef_cache_boundary(
+            self.decision_layout,
+            len(self.origin_input_ids),
+            get_schedule().page_size or 1,
+            mamba_cache_chunk_size(),
+        )
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
     def init_incremental_detokenize(self):

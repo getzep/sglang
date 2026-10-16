@@ -1646,6 +1646,15 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 def create_memory_pool_configurator(
     kvc: KVCacheConfigurator,
 ) -> MemoryPoolConfigurator:
+    if (
+        get_memory().clef_prefix_cache
+        and kvc.model_config.joint_head_config is not None
+    ):
+        from sglang.srt.model_executor.clef_pool_configurator import (
+            ClefPoolConfigurator,
+        )
+
+        return ClefPoolConfigurator(kvc)
     if is_deepseek_v4(kvc.model_config.hf_config) and kvc.is_hybrid_swa:
         return DSV4PoolConfigurator(kvc)
     if kvc.is_hybrid_swa:

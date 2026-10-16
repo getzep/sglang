@@ -125,6 +125,41 @@ def parse_decision_layout(
     return questions
 
 
+def compute_clef_cache_boundary(
+    layout: Sequence[int],
+    expanded_prompt_length: int,
+    page_size: int,
+    mamba_cache_chunk_size: int,
+) -> int:
+    questions = parse_decision_layout(layout, expanded_prompt_length)
+    span_starts = [question.question_span[0] for question in questions]
+    span_starts.extend(
+        start for question in questions for start, _ in question.option_spans
+    )
+    alignment = math.lcm(page_size, mamba_cache_chunk_size)
+    return min(span_starts) // alignment * alignment
+
+
+def validate_clef_lm_head(lm_head: nn.Module) -> None:
+    from sglang.srt.layers.quantization.unquant import (
+        UnquantizedEmbeddingMethod,
+        UnquantizedLinearMethod,
+    )
+
+    quant_method = getattr(lm_head, "quant_method", None)
+    if not isinstance(
+        quant_method, (UnquantizedEmbeddingMethod, UnquantizedLinearMethod)
+    ):
+        raise ValueError("Clef joint schema scoring requires an unquantized lm_head")
+    weight = getattr(lm_head, "weight", None)
+    if weight is None or not torch.is_floating_point(weight):
+        dtype = getattr(weight, "dtype", None)
+        raise ValueError(
+            f"Clef joint schema scoring requires a floating-point lm_head weight; "
+            f"got {dtype}"
+        )
+
+
 class EvidenceRoutingLayer(nn.Module):
     def __init__(self, width: int, heads: int, feedforward: int) -> None:
         super().__init__()
@@ -190,6 +225,10 @@ class JointSchemaHead(nn.Module):
         self.residual_gate = nn.Parameter(torch.zeros(()))
 
     @torch.no_grad()
+    def project_memory(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self.memory_projection(self.hidden_norm(hidden))
+
+    @torch.no_grad()
     def forward_batch(
         self,
         hidden: torch.Tensor,
@@ -197,6 +236,8 @@ class JointSchemaHead(nn.Module):
         lengths: List[int],
         layouts: List[List[LayoutQuestion]],
         output_embedding_weight: torch.Tensor,
+        prefix_memory: Optional[List[Optional[torch.Tensor]]] = None,
+        extend_memory: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         """One FP32 logit vector per request, its questions' options in layout order.
 
@@ -204,7 +245,15 @@ class JointSchemaHead(nn.Module):
         """
         outputs: List[torch.Tensor] = []
         start = 0
-        for group in _groups(lengths, layouts):
+        prefix_lengths = (
+            [0] * len(lengths)
+            if prefix_memory is None
+            else [0 if rows is None else rows.shape[0] for rows in prefix_memory]
+        )
+        full_lengths = [
+            length + prefix for length, prefix in zip(lengths, prefix_lengths)
+        ]
+        for group in _groups(full_lengths, layouts):
             group_lengths = [lengths[i] for i in group]
             end = start + sum(group_lengths)
             outputs += self._forward_group(
@@ -213,6 +262,8 @@ class JointSchemaHead(nn.Module):
                 group_lengths,
                 [layouts[i] for i in group],
                 output_embedding_weight,
+                None if prefix_memory is None else [prefix_memory[i] for i in group],
+                None if extend_memory is None else extend_memory[start:end],
             )
             start = end
         return outputs
@@ -224,13 +275,26 @@ class JointSchemaHead(nn.Module):
         lengths: List[int],
         layouts: List[List[LayoutQuestion]],
         output_embedding_weight: torch.Tensor,
+        prefix_memory: Optional[List[Optional[torch.Tensor]]] = None,
+        extend_memory: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         device, dtype = hidden.device, hidden.dtype
         batch = len(layouts)
         question_bounds, option_bounds = [], []
         type_ids, owner, slot, question_request, last_tokens = [], [], [], [], []
         regions, region_offsets = [], [0]
-        token_cu, question_cu, option_cu, option_counts = [0], [0], [0], []
+        token_cu, full_token_cu, question_cu, option_cu, option_counts = (
+            [0],
+            [0],
+            [0],
+            [0],
+            [],
+        )
+        prefix_lengths = (
+            [0] * batch
+            if prefix_memory is None
+            else [0 if rows is None else rows.shape[0] for rows in prefix_memory]
+        )
         for request, (length, questions) in enumerate(zip(lengths, layouts)):
             offset = token_cu[-1]
             low = min(min(q.question_span[0], q.option_spans[0][0]) for q in questions)
@@ -259,6 +323,7 @@ class JointSchemaHead(nn.Module):
                 request_options += count
             last_tokens.append(offset + length - 1)
             token_cu.append(offset + length)
+            full_token_cu.append(full_token_cu[-1] + length + prefix_lengths[request])
             region_offsets.append(region_offsets[-1] + high - low)
             question_cu.append(len(type_ids))
             option_cu.append(option_cu[-1] + request_options)
@@ -304,7 +369,16 @@ class JointSchemaHead(nn.Module):
         token_cu_t, question_cu_t, option_cu_t = (
             cu_t.to(torch.int32).view(3, batch + 1).unbind(0)
         )
-        token_bounds = (token_cu_t, max(lengths))
+        if any(prefix_lengths):
+            full_token_cu_t = torch.tensor(full_token_cu, dtype=torch.int32).to(
+                device, non_blocking=True
+            )
+            token_bounds = (
+                full_token_cu_t,
+                max(length + prefix for length, prefix in zip(lengths, prefix_lengths)),
+            )
+        else:
+            token_bounds = (token_cu_t, max(lengths))
         question_bounds_cu = (question_cu_t, max(len(q) for q in layouts))
         option_bounds_cu = (option_cu_t, max(option_counts))
 
@@ -337,7 +411,25 @@ class JointSchemaHead(nn.Module):
             sums = prefix[bounds[:, 1]] - prefix[bounds[:, 0]]
             return (sums / (bounds[:, 1] - bounds[:, 0]).unsqueeze(-1)).to(dtype)
 
-        memory = self.memory_projection(normalized)
+        if extend_memory is None:
+            extend_memory = self.memory_projection(normalized)
+        if any(prefix_lengths):
+            memory_parts = []
+            start = 0
+            for length, prefix_rows in zip(lengths, prefix_memory):
+                if prefix_rows is not None:
+                    if prefix_rows.shape[1] != extend_memory.shape[1]:
+                        raise ValueError(
+                            "Clef prefix memory width does not match the joint head"
+                        )
+                    memory_parts.append(
+                        prefix_rows.to(device=device, dtype=extend_memory.dtype)
+                    )
+                memory_parts.append(extend_memory[start : start + length])
+                start += length
+            memory = torch.cat(memory_parts, dim=0)
+        else:
+            memory = extend_memory
         global_vectors = normalized[last_tokens_t]
         question_vectors = span_means(hidden_prefix, question_bounds_t)
         option_contexts = span_means(hidden_prefix, option_bounds_t)
@@ -428,6 +520,19 @@ def _attention(
     """nn.MultiheadAttention over packed sequences, keys and values from ``keys``
     (or from ``queries`` when None), attending within each request."""
     width = queries.shape[-1]
+    if queries.device.type == "cpu":
+        query_cu = query_bounds[0].tolist()
+        key_cu = key_bounds[0].tolist()
+        output = []
+        for index in range(len(query_cu) - 1):
+            query = queries[query_cu[index] : query_cu[index + 1]].unsqueeze(0)
+            if keys is None:
+                key = query
+            else:
+                key = keys[key_cu[index] : key_cu[index + 1]].unsqueeze(0)
+            attended, _ = module(query, key, key, need_weights=False)
+            output.append(attended.squeeze(0))
+        return torch.cat(output, dim=0)
     heads = module.num_heads
     if keys is None:
         query, key, value = F.linear(
@@ -486,6 +591,17 @@ class JointSchemaPooler(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, forward_batch
     ) -> EmbeddingPoolerOutput:
+        prefix_cache_enabled = getattr(forward_batch, "clef_prefix_cache", False)
+        extend_memory = None
+        if prefix_cache_enabled:
+            extend_memory = self.head.project_memory(hidden_states)
+            pool = getattr(forward_batch, "token_to_kv_pool", None)
+            locations = forward_batch.out_cache_loc
+            if pool is None or not hasattr(pool, "store_clef_memory"):
+                raise ValueError("Clef prefix cache has no memory-row KV pool")
+            if locations is None:
+                raise ValueError("Clef prefix cache has no output cache locations")
+            pool.store_clef_memory(locations, extend_memory)
         if (
             forward_batch.decision_layouts is None
             or forward_batch.extend_seq_lens_cpu is None
@@ -502,20 +618,67 @@ class JointSchemaPooler(nn.Module):
         embeddings: List[torch.Tensor] = [
             hidden_states.new_empty(0, dtype=torch.float32) for _ in lengths
         ]
-        # The tokenizer manager checks every layout against its prompt, and the
-        # server runs each prompt in one uncached prefill. A layout that no longer
-        # fits its prompt, as after a truncation, gets no scores, which the
-        # decision route reports as a server error.
         layouts = {}
-        for i, (layout, prefix, length) in enumerate(
-            zip(raw_layouts, prefix_lengths, lengths)
-        ):
-            if layout is None or prefix != 0:
-                continue
-            try:
-                layouts[i] = parse_decision_layout(layout, length)
-            except ValueError:
-                continue
+        if prefix_cache_enabled:
+            boundaries = getattr(forward_batch, "clef_cache_boundaries", None) or [
+                None
+            ] * len(lengths)
+            for i, (layout, prefix, length, boundary) in enumerate(
+                zip(raw_layouts, prefix_lengths, lengths, boundaries)
+            ):
+                if layout is None:
+                    continue
+                rid = (
+                    forward_batch.rids[i]
+                    if getattr(forward_batch, "rids", None) is not None
+                    else i
+                )
+                if boundary is None or prefix > boundary:
+                    raise ValueError(
+                        f"Clef request {rid} has prefix length {prefix} beyond "
+                        f"cache boundary {boundary}"
+                    )
+                try:
+                    questions = parse_decision_layout(layout, prefix + length)
+                except ValueError:
+                    continue
+                if any(
+                    start < prefix
+                    for question in questions
+                    for start in (
+                        question.question_span[0],
+                        *(span[0] for span in question.option_spans),
+                    )
+                ):
+                    raise ValueError(
+                        f"Clef request {rid} has a decision span before prefix "
+                        f"length {prefix}"
+                    )
+                layouts[i] = [
+                    LayoutQuestion(
+                        question.question_type,
+                        (
+                            question.question_span[0] - prefix,
+                            question.question_span[1] - prefix,
+                        ),
+                        tuple(
+                            (start - prefix, end - prefix)
+                            for start, end in question.option_spans
+                        ),
+                    )
+                    for question in questions
+                ]
+        else:
+            # Keep the original uncached layout handling on the default path.
+            for i, (layout, prefix, length) in enumerate(
+                zip(raw_layouts, prefix_lengths, lengths)
+            ):
+                if layout is None or prefix != 0:
+                    continue
+                try:
+                    layouts[i] = parse_decision_layout(layout, length)
+                except ValueError:
+                    continue
         offsets = [0]
         for length in lengths:
             offsets.append(offsets[-1] + length)
@@ -527,13 +690,39 @@ class JointSchemaPooler(nn.Module):
                 runs.append([i])
         for run in runs:
             start, end = offsets[run[0]], offsets[run[-1] + 1]
-            logits = self.head.forward_batch(
+            run_prefix_memory = None
+            if prefix_cache_enabled:
+                pool = forward_batch.token_to_kv_pool
+                req_to_token = forward_batch.req_to_token
+                if req_to_token is None:
+                    raise ValueError("Clef prefix cache has no request-to-token table")
+                run_prefix_memory = []
+                for i in run:
+                    prefix = prefix_lengths[i]
+                    if prefix == 0:
+                        run_prefix_memory.append(None)
+                    else:
+                        token_locations = req_to_token[
+                            forward_batch.req_pool_indices[i], :prefix
+                        ]
+                        run_prefix_memory.append(
+                            pool.gather_clef_memory(token_locations)
+                        )
+            arguments = (
                 hidden_states[start:end],
                 forward_batch.input_ids[start:end],
                 [lengths[i] for i in run],
                 [layouts[i] for i in run],
                 self._output_embedding(),
             )
+            if prefix_cache_enabled:
+                logits = self.head.forward_batch(
+                    *arguments,
+                    prefix_memory=run_prefix_memory,
+                    extend_memory=extend_memory[start:end],
+                )
+            else:
+                logits = self.head.forward_batch(*arguments)
             for i, values in zip(run, logits):
                 embeddings[i] = values
         return EmbeddingPoolerOutput(embeddings=embeddings)
