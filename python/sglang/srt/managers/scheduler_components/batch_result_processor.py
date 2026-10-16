@@ -491,6 +491,20 @@ class SchedulerBatchResultProcessor:
                     if req.finished():
                         release_kv_cache(req, self.tree_cache, checkpoint=True)
                         req.time_stats.set_completion_time()
+                        if (
+                            req.decision_layout is not None
+                            and envs.SGLANG_CLEF_SPIKE_LOG.get()
+                        ):
+                            prefix_lens = batch.prefix_lens or []
+                            extend_lens = batch.extend_lens or []
+                            logger.info(
+                                "CLEF_SPIKE_RESULT rid=%s "
+                                "kept_embedding_from=final_forward "
+                                "extend_prefix_len=%s extend_seq_len=%s",
+                                req.rid,
+                                prefix_lens[i] if i < len(prefix_lens) else None,
+                                extend_lens[i] if i < len(extend_lens) else None,
+                            )
                     else:
                         checkpoint_kv_cache(req, self.tree_cache)
                 else:

@@ -12,6 +12,7 @@ from sglang.srt.layers.joint_schema_head import (
     JointSchemaHead,
     JointSchemaPooler,
     LayoutQuestion,
+    compute_clef_cache_boundary,
     pack_decision_layout,
     parse_decision_layout,
 )
@@ -66,6 +67,34 @@ class TestDecisionLayout(CustomTestCase):
         for name, (values, num_tokens) in invalid.items():
             with self.subTest(name), self.assertRaises(ValueError):
                 parse_decision_layout(values, num_tokens)
+
+
+class TestClefCacheBoundary(CustomTestCase):
+    def test_text_prompt_boundary_aligns_to_page_and_mamba_chunk(self):
+        layout = pack_decision_layout(
+            300,
+            [LayoutQuestion(0, (130, 140), ((129, 150),))],
+        )
+        boundary = compute_clef_cache_boundary(
+            layout,
+            expanded_prompt_length=300,
+            page_size=16,
+            mamba_cache_chunk_size=64,
+        )
+        self.assertEqual(boundary, 128)
+
+    def test_image_expansion_shifts_boundary_before_alignment(self):
+        layout = pack_decision_layout(
+            300,
+            [LayoutQuestion(0, (130, 140), ((129, 150),))],
+        )
+        boundary = compute_clef_cache_boundary(
+            layout,
+            expanded_prompt_length=366,
+            page_size=16,
+            mamba_cache_chunk_size=64,
+        )
+        self.assertEqual(boundary, 192)
 
 
 class _RecordingHead:

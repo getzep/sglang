@@ -349,7 +349,17 @@ class SchedulePolicy:
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
             cache_salt = r.cache_salt
-            match_result = match_kv_cache(r, self.tree_cache, prefix_ids)
+            clef_boundary = r._clef_cache_boundary()
+            if clef_boundary is None:
+                match_result = match_kv_cache(r, self.tree_cache, prefix_ids)
+            else:
+                max_prefix_len = r._compute_max_prefix_len(len(prefix_ids))
+                match_result = match_kv_cache(
+                    r,
+                    self.tree_cache,
+                    prefix_ids,
+                    max_prefix_len=max_prefix_len,
+                )
 
             # NOTE(sang): This logic is for in-batch prefix caching;
             # If there are more than 1 request that have small matching prefix from
@@ -362,7 +372,11 @@ class SchedulePolicy:
                 match_result = self.waiting_queue_radix_tree.match_prefix(
                     MatchPrefixParams(
                         key=RadixKey(
-                            token_ids=prefix_ids,
+                            token_ids=(
+                                prefix_ids[:max_prefix_len]
+                                if clef_boundary is not None
+                                else prefix_ids
+                            ),
                             extra_key=extra_key,
                             cache_salt=cache_salt,
                         )

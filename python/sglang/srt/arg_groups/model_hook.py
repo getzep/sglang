@@ -985,11 +985,14 @@ def handle_model_capability_adjustments(server_args: Any):
                 "Clef checkpoints are served with --tp-size 1 and --pp-size 1, "
                 "since the joint schema head reads full LM head rows"
             )
-        for key, value in (
-            ("is_embedding", True),
-            ("disable_radix_cache", True),
-            ("chunked_prefill_size", -1),
-        ):
+        clef_resolutions = [("is_embedding", True)]
+        if cfg.clef_prefix_cache:
+            clef_resolutions.append(("mamba_radix_cache_strategy", "extra_buffer"))
+        else:
+            clef_resolutions.extend(
+                [("disable_radix_cache", True), ("chunked_prefill_size", -1)]
+            )
+        for key, value in clef_resolutions:
             declare_resolution(
                 server_args, "_handle_model_capability_adjustments", **{key: value}
             )
@@ -1001,10 +1004,16 @@ def handle_model_capability_adjustments(server_args: Any):
                     cfg.cuda_graph_config, phase, backend=Backend.DISABLED
                 ),
             )
-        logger.info(
-            "Clef joint schema head detected: serving /v1/systemone decisions in "
-            "embedding mode without radix cache, chunked prefill, or CUDA graphs."
-        )
+        if cfg.clef_prefix_cache:
+            logger.info(
+                "Clef prefix-cache spike enabled: radix cache and chunked prefill "
+                "remain available; CUDA graphs stay disabled."
+            )
+        else:
+            logger.info(
+                "Clef joint schema head detected: serving /v1/systemone decisions in "
+                "embedding mode without radix cache, chunked prefill, or CUDA graphs."
+            )
 
     if (
         model_config.is_multimodal

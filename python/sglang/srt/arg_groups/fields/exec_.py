@@ -462,6 +462,10 @@ class ExecMamba(msgspec.Struct):
             resolvable=True,
         ),
     ] = "auto"
+    clef_prefix_cache: A[
+        bool,
+        Arg(help="Enable prefix caching and chunked prefill for Clef checkpoints."),
+    ] = False
     uses_mamba_radix_cache: A[
         bool,
         Arg(

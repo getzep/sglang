@@ -15,6 +15,7 @@ more than its memory projection.
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import Callable, List, Optional, Sequence, Tuple
 
@@ -23,7 +24,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
+
+logger = logging.getLogger(__name__)
 
 # Question types in the order of the head's type embedding.
 QUESTION_TYPES = ("noul", "choice", "score")
@@ -123,6 +127,21 @@ def parse_decision_layout(
     if cursor != len(layout):
         raise ValueError("decision_layout has trailing values")
     return questions
+
+
+def compute_clef_cache_boundary(
+    layout: Sequence[int],
+    expanded_prompt_length: int,
+    page_size: int,
+    mamba_cache_chunk_size: int,
+) -> int:
+    questions = parse_decision_layout(layout, expanded_prompt_length)
+    span_starts = [question.question_span[0] for question in questions]
+    span_starts.extend(
+        start for question in questions for start, _ in question.option_spans
+    )
+    alignment = math.lcm(page_size, mamba_cache_chunk_size)
+    return min(span_starts) // alignment * alignment
 
 
 class EvidenceRoutingLayer(nn.Module):
@@ -486,6 +505,43 @@ class JointSchemaPooler(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, forward_batch
     ) -> EmbeddingPoolerOutput:
+        if (
+            envs.SGLANG_CLEF_SPIKE_LOG.get()
+            and forward_batch.decision_layouts is not None
+        ):
+            rids = forward_batch.rids or []
+            prefix_lengths = forward_batch.extend_prefix_lens_cpu or []
+            extend_lengths = forward_batch.extend_seq_lens_cpu or []
+            original_lengths = forward_batch.orig_seq_lens
+            for index in range(forward_batch.batch_size):
+                if (
+                    index >= len(forward_batch.decision_layouts)
+                    or forward_batch.decision_layouts[index] is None
+                ):
+                    continue
+                prefix_len = (
+                    prefix_lengths[index] if index < len(prefix_lengths) else None
+                )
+                extend_len = (
+                    extend_lengths[index] if index < len(extend_lengths) else None
+                )
+                final_chunk = None
+                if (
+                    prefix_len is not None
+                    and extend_len is not None
+                    and original_lengths is not None
+                ):
+                    final_chunk = (
+                        prefix_len + extend_len >= int(original_lengths[index])
+                    )
+                logger.info(
+                    "CLEF_SPIKE_POOLER rid=%s extend_prefix_len=%s "
+                    "extend_seq_len=%s final_chunk=%s",
+                    rids[index] if index < len(rids) else None,
+                    prefix_len,
+                    extend_len,
+                    final_chunk,
+                )
         if (
             forward_batch.decision_layouts is None
             or forward_batch.extend_seq_lens_cpu is None
