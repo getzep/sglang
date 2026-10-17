@@ -37,6 +37,7 @@ from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 from sglang.srt.configs.model_config import (
     load_decision_config,
     load_joint_head_config,
+    resolve_joint_head_file,
 )
 from sglang.srt.configs.qwen3_5 import (
     Qwen3_5Config,
@@ -2533,11 +2534,15 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
     def _load_joint_head(self) -> None:
         """Load joint_head.safetensors, which the checkpoint index leaves out."""
         model = get_model()
-        state_dict = load_file(
-            cached_file(
-                model.model_path, "joint_head.safetensors", revision=model.revision
-            )
+        path = resolve_joint_head_file(
+            model.model_path, model.revision, "joint_head.safetensors"
         )
+        if path is None:
+            raise FileNotFoundError(
+                "Clef checkpoint is missing joint_head.safetensors at the model "
+                "root and in clef_head/"
+            )
+        state_dict = load_file(path)
         self.pooler.head.load_state_dict(state_dict, strict=True)
 
     def _load_decision_readout(self) -> None:

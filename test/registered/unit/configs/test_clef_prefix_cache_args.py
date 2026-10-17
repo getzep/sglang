@@ -1,3 +1,5 @@
+import unittest
+
 """Compatibility checks for Clef prefix-memory caching."""
 
 from types import SimpleNamespace
@@ -83,3 +85,7 @@ class TestClefPrefixCacheCompatibility(CustomTestCase):
             speculative_algorithm="EAGLE3",
         )
         _validate_clef_prefix_cache_compatibility(args)
+
+
+if __name__ == "__main__":
+    unittest.main()

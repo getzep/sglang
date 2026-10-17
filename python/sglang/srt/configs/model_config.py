@@ -291,17 +291,27 @@ def load_decision_config(model_path: str, revision: Optional[str]) -> Optional[d
     return config
 
 
+def resolve_joint_head_file(
+    model_path: str, revision: Optional[str], name: str
+) -> Optional[str]:
+    for path in (name, f"clef_head/{name}"):
+        resolved = cached_file(
+            model_path,
+            path,
+            revision=revision,
+            _raise_exceptions_for_missing_entries=False,
+            _raise_exceptions_for_connection_errors=False,
+        )
+        if resolved is not None:
+            return resolved
+    return None
+
+
 @lru_cache
 def load_joint_head_config(model_path: str, revision: Optional[str]) -> Optional[dict]:
     """joint_head_config.json of a Clef checkpoint, whose joint schema head
     answers /v1/systemone decisions from the backbone's hidden states."""
-    path = cached_file(
-        model_path,
-        "joint_head_config.json",
-        revision=revision,
-        _raise_exceptions_for_missing_entries=False,
-        _raise_exceptions_for_connection_errors=False,
-    )
+    path = resolve_joint_head_file(model_path, revision, "joint_head_config.json")
     if path is None:
         return None
     with open(path) as f:
