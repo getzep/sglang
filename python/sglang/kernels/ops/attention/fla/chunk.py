@@ -45,6 +45,8 @@ def chunk_gated_delta_rule_fwd(
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: torch.LongTensor | None = None,
     inplace_update: bool = True,
+    track_state: Optional[torch.Tensor] = None,
+    track_chunk_idx: Optional[torch.Tensor] = None,
 ):
     g = chunk_local_cumsum(
         g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
@@ -70,6 +72,8 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         inplace_update=inplace_update,
+        track_state=track_state,
+        track_chunk_idx=track_chunk_idx,
     )
     o = chunk_fwd_o(
         q=q,
@@ -103,6 +107,8 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         cu_seqlens: Optional[torch.LongTensor] = None,
         use_qk_l2norm_in_kernel: bool = False,
         inplace_update: bool = True,
+        track_state: Optional[torch.Tensor] = None,
+        track_chunk_idx: Optional[torch.Tensor] = None,
     ):
         q_orig = q
         k_orig = k
@@ -128,6 +134,8 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
             inplace_update=inplace_update,
+            track_state=track_state,
+            track_chunk_idx=track_chunk_idx,
         )
         return o.to(q.dtype), h
 
@@ -146,6 +154,8 @@ def chunk_gated_delta_rule(
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     inplace_update: bool = True,
+    track_state: Optional[torch.Tensor] = None,
+    track_chunk_idx: Optional[torch.Tensor] = None,
 ):
     r"""
     Args:
@@ -177,6 +187,13 @@ def chunk_gated_delta_rule(
         inplace_update (Optional[bool]):
             Whether to write final states back to `initial_state`. Default: `True`.
 
+        track_state (Optional[torch.Tensor]):
+            fp32 buffer of shape `[N, H, V, K]` that receives, for each sequence `n` with
+            `track_chunk_idx[n] >= 0`, the recurrent state at the start of chunk
+            `track_chunk_idx[n]` from the in-kernel fp32 accumulator. The per-chunk
+            states `h` hold the same state rounded to the activation dtype.
+        track_chunk_idx (Optional[torch.Tensor]):
+            int32 chunk index per sequence, `-1` for sequences that are not tracked.
     Returns:
         o (torch.Tensor):
             Outputs of shape `[B, T, H, V]` if `head_first=False` else `[B, H, T, V]`.
@@ -263,6 +280,8 @@ def chunk_gated_delta_rule(
         cu_seqlens,
         use_qk_l2norm_in_kernel,
         inplace_update,
+        track_state,
+        track_chunk_idx,
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")
