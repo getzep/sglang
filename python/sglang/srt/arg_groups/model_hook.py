@@ -66,6 +66,10 @@ def _validate_clef_prefix_cache_compatibility(cfg: Any) -> None:
         incompatible.append("--enable-lmcache")
     if cfg.lmcache_config_file is not None:
         incompatible.append("--lmcache-config-file")
+    if cfg.enable_unified_cache_external_linker:
+        incompatible.append("--enable-unified-cache-external-linker")
+    if cfg.radix_cache_backend is not None:
+        incompatible.append("--radix-cache-backend")
     if cfg.enable_unified_memory:
         incompatible.append("--enable-unified-memory")
     if cfg.dp_size > 1 or cfg.attn_dp_size > 1 or cfg.enable_dp_attention:

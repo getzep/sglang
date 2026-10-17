@@ -20,6 +20,8 @@ class TestClefPrefixCacheCompatibility(CustomTestCase):
             "hicache_storage_backend_extra_config": None,
             "enable_lmcache": False,
             "lmcache_config_file": None,
+            "enable_unified_cache_external_linker": False,
+            "radix_cache_backend": None,
             "enable_unified_memory": False,
             "dp_size": 1,
             "attn_dp_size": 1,
@@ -39,6 +41,11 @@ class TestClefPrefixCacheCompatibility(CustomTestCase):
             ),
             ({"enable_lmcache": True}, "--enable-lmcache"),
             ({"lmcache_config_file": "lmcache.yaml"}, "--lmcache-config-file"),
+            (
+                {"enable_unified_cache_external_linker": True},
+                "--enable-unified-cache-external-linker",
+            ),
+            ({"radix_cache_backend": "flexkv"}, "--radix-cache-backend"),
         )
         for overrides, option in cases:
             with self.subTest(option=option):

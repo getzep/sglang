@@ -615,7 +615,7 @@ class TestJointSchemaHeadPrefixMemory(CustomTestCase):
         head = (
             JointSchemaHead(
                 hidden_size,
-                width=8,
+                width=16,
                 routing_layers=1,
                 layers=1,
                 heads=2,
@@ -679,7 +679,7 @@ class TestJointSchemaHeadPrefixMemory(CustomTestCase):
         head = (
             JointSchemaHead(
                 hidden_size,
-                width=8,
+                width=16,
                 routing_layers=1,
                 layers=1,
                 heads=2,
@@ -736,20 +736,31 @@ class TestJointSchemaHeadPrefixMemory(CustomTestCase):
     def test_t2_mixed_prefix_batch_matches_full_requests_cuda(self):
         self._run_t2(torch.device("cuda"))
 
-    def test_t3_no_prefix_is_equal_to_origin_main_forward_batch(self):
+    def _run_t3(self, device):
         torch.manual_seed(19)
         hidden_size, vocab = 16, 64
-        head = JointSchemaHead(
-            hidden_size, width=8, routing_layers=1, layers=1, heads=2, feedforward=16
-        ).eval()
+        dtype = torch.float32 if device.type == "cpu" else torch.bfloat16
+        width = 8 if device.type == "cpu" else 16
+        head = (
+            JointSchemaHead(
+                hidden_size,
+                width=width,
+                routing_layers=1,
+                layers=1,
+                heads=2,
+                feedforward=16,
+            )
+            .to(device=device, dtype=dtype)
+            .eval()
+        )
         lengths = [40, 32]
         layouts = [_questions(), _questions()]
-        hidden = torch.randn(sum(lengths), hidden_size)
-        input_ids = torch.randint(vocab, (sum(lengths),))
-        lm_head = torch.randn(vocab, hidden_size)
+        hidden = torch.randn(sum(lengths), hidden_size, device=device, dtype=dtype)
+        input_ids = torch.randint(vocab, (sum(lengths),), device=device)
+        lm_head = torch.randn(vocab, hidden_size, device=device, dtype=dtype)
         with torch.no_grad():
             actual = head.forward_batch(hidden, input_ids, lengths, layouts, lm_head)
-            if hidden.device.type == "cpu":
+            if device.type == "cpu":
                 with patch(__name__ + "._attention", _cpu_attention):
                     expected = _origin_main_forward_batch(
                         head, hidden, input_ids, lengths, layouts, lm_head
@@ -760,6 +771,13 @@ class TestJointSchemaHeadPrefixMemory(CustomTestCase):
                 )
         for actual_logits, expected_logits in zip(actual, expected):
             self.assertTrue(torch.equal(actual_logits, expected_logits))
+
+    def test_t3_no_prefix_is_equal_to_origin_main_forward_batch(self):
+        self._run_t3(torch.device("cpu"))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is not available")
+    def test_t3_no_prefix_is_equal_to_origin_main_forward_batch_cuda(self):
+        self._run_t3(torch.device("cuda"))
 
     def test_t4_stores_rows_and_reuses_slots_without_stale_memory(self):
         class FakePool:
