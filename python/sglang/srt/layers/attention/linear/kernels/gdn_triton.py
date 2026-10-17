@@ -191,9 +191,16 @@ class TritonGDNKernel(LinearAttnKernelBase):
                 raise NotImplementedError(
                     "track_state snapshots are only supported by the Triton chunk kernel"
                 )
+            track_chunk_idx = kwargs["track_chunk_idx"]
+            # The kernel reads track_chunk_idx[i_n] for every sequence in
+            # cu_seqlens, so a shorter index would be read past its end.
+            assert track_chunk_idx.shape[0] == query_start_loc.shape[0] - 1, (
+                f"track_chunk_idx has {track_chunk_idx.shape[0]} rows for "
+                f"{query_start_loc.shape[0] - 1} sequences"
+            )
             track_state_args = {
                 "track_state": kwargs["track_state"],
-                "track_chunk_idx": kwargs["track_chunk_idx"],
+                "track_chunk_idx": track_chunk_idx,
             }
         if is_cpu():
             if not inplace_update:

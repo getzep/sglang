@@ -124,11 +124,16 @@ class TestGdnTrackState(CustomTestCase):
                 torch.testing.assert_close(
                     track_state[seq], ref_state[0], rtol=1e-5, atol=1e-5
                 )
-                # `h` holds the same state rounded to bf16: equal after rounding,
-                # and the snapshot is closer to the fp32 reference than `h`.
+                # `h` holds the same state rounded to bf16 (within one bf16
+                # ulp, because a different autotune configuration can change
+                # the accumulation order), and the snapshot is closer to the
+                # fp32 reference than `h`.
                 h_row = h.squeeze(0)[h_rows[seq] + chunk].to(torch.float32)
                 torch.testing.assert_close(
-                    h_row, ref_state[0].to(torch.bfloat16).to(torch.float32)
+                    h_row,
+                    ref_state[0].to(torch.bfloat16).to(torch.float32),
+                    rtol=2**-7,
+                    atol=1e-6,
                 )
                 snapshot_err = (track_state[seq] - ref_state[0]).abs().max()
                 h_err = (h_row - ref_state[0]).abs().max()
