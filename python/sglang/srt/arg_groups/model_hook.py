@@ -51,6 +51,37 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 
 
+def _validate_clef_prefix_cache_compatibility(cfg: Any) -> None:
+    if not cfg.clef_prefix_cache:
+        return
+
+    incompatible = []
+    if cfg.enable_hierarchical_cache:
+        incompatible.append("--enable-hierarchical-cache")
+    if cfg.hicache_storage_backend is not None:
+        incompatible.append("--hicache-storage-backend")
+    if cfg.hicache_storage_backend_extra_config is not None:
+        incompatible.append("--hicache-storage-backend-extra-config")
+    if cfg.enable_lmcache:
+        incompatible.append("--enable-lmcache")
+    if cfg.lmcache_config_file is not None:
+        incompatible.append("--lmcache-config-file")
+    if cfg.enable_unified_memory:
+        incompatible.append("--enable-unified-memory")
+    if cfg.dp_size > 1 or cfg.attn_dp_size > 1 or cfg.enable_dp_attention:
+        incompatible.append(
+            "--dp-size, --attention-data-parallel-size, or --enable-dp-attention"
+        )
+    if cfg.speculative_algorithm is not None:
+        incompatible.append("--speculative-algorithm")
+    if incompatible:
+        options = ", ".join(incompatible)
+        raise ValueError(
+            f"--clef-prefix-cache is incompatible with {options}; these features "
+            "can load KV prefixes without the required Clef memory rows"
+        )
+
+
 def _validate_dsa_tbo_index_sharing(server_args: Any, hf_config: Any) -> None:
     cfg = resolving_view(server_args)
     if not cfg.enable_two_batch_overlap:
@@ -978,6 +1009,7 @@ def handle_model_capability_adjustments(server_args: Any):
     # A Clef checkpoint's joint schema head reads every prompt token in one
     # pass. Each request uses embedding mode and one complete prefill.
     if model_config.joint_head_config is not None:
+        _validate_clef_prefix_cache_compatibility(cfg)
         if cfg.tp_size != 1 or cfg.pp_size != 1:
             raise ValueError(
                 "Clef checkpoints are served with --tp-size 1 and --pp-size 1, "

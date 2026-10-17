@@ -4,15 +4,17 @@ the batched forward against a per-request loop over the stock torch modules."""
 import math
 import unittest
 from types import SimpleNamespace
+from typing import List, Optional, Tuple
+from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
+from torch import nn
 
 from sglang.srt.layers.joint_schema_head import (
     JointSchemaHead,
     JointSchemaPooler,
     LayoutQuestion,
-    _groups,
     compute_clef_cache_boundary,
     pack_decision_layout,
     parse_decision_layout,
@@ -301,13 +303,295 @@ def _shift_layout(questions, prefix):
     ]
 
 
+_MAX_GROUP_TOKENS = 65536
+_MAX_GROUP_SLOTS = 1 << 18
+
+
+def _attention(
+    module: nn.MultiheadAttention,
+    queries: torch.Tensor,
+    keys: Optional[torch.Tensor],
+    query_bounds: Tuple[torch.Tensor, int],
+    key_bounds: Tuple[torch.Tensor, int],
+) -> torch.Tensor:
+    """nn.MultiheadAttention over packed sequences, keys and values from ``keys``
+    (or from ``queries`` when None), attending within each request."""
+    width = queries.shape[-1]
+    heads = module.num_heads
+    if keys is None:
+        query, key, value = F.linear(
+            queries, module.in_proj_weight, module.in_proj_bias
+        ).chunk(3, dim=-1)
+    else:
+        query_weight, key_value_weight = module.in_proj_weight.split([width, 2 * width])
+        query_bias, key_value_bias = module.in_proj_bias.split([width, 2 * width])
+        query = F.linear(queries, query_weight, query_bias)
+        key, value = F.linear(keys, key_value_weight, key_value_bias).chunk(2, dim=-1)
+    head_dim = width // heads
+    output = torch.ops.aten._flash_attention_forward(
+        query.reshape(-1, heads, head_dim),
+        key.reshape(-1, heads, head_dim),
+        value.reshape(-1, heads, head_dim),
+        query_bounds[0],
+        key_bounds[0],
+        query_bounds[1],
+        key_bounds[1],
+        0.0,
+        False,
+        False,
+    )[0]
+    return module.out_proj(output.reshape(-1, width))
+
+
+def _cpu_attention(
+    module: nn.MultiheadAttention,
+    queries: torch.Tensor,
+    keys: Optional[torch.Tensor],
+    query_bounds: Tuple[torch.Tensor, int],
+    key_bounds: Tuple[torch.Tensor, int],
+) -> torch.Tensor:
+    query_cu = query_bounds[0].tolist()
+    key_cu = key_bounds[0].tolist()
+    output = []
+    for index in range(len(query_cu) - 1):
+        query = queries[query_cu[index] : query_cu[index + 1]].unsqueeze(0)
+        if keys is None:
+            key = query
+        else:
+            key = keys[key_cu[index] : key_cu[index + 1]].unsqueeze(0)
+        attended, _ = module(query, key, key, need_weights=False)
+        output.append(attended.squeeze(0))
+    return torch.cat(output, dim=0)
+
+
+def _groups(lengths: List[int], layouts: List[List[LayoutQuestion]]) -> List[range]:
+    """Consecutive requests per head pass, bounded in tokens and padded option slots."""
+    groups, start, tokens, questions, widest = [], 0, 0, 0, 0
+    for index, (length, layout) in enumerate(zip(lengths, layouts)):
+        layout_widest = max(len(question.option_spans) for question in layout)
+        grown = (questions + len(layout)) * max(widest, layout_widest)
+        if index > start and (
+            tokens + length > _MAX_GROUP_TOKENS or grown > _MAX_GROUP_SLOTS
+        ):
+            groups.append(range(start, index))
+            start, tokens, questions, widest = index, 0, 0, 0
+        tokens += length
+        questions += len(layout)
+        widest = max(widest, layout_widest)
+    groups.append(range(start, len(lengths)))
+    return groups
+
+
+class _OriginMainJointSchemaHead:
+    def _forward_group(
+        self,
+        hidden: torch.Tensor,
+        input_ids: torch.Tensor,
+        lengths: List[int],
+        layouts: List[List[LayoutQuestion]],
+        output_embedding_weight: torch.Tensor,
+    ) -> List[torch.Tensor]:
+        device, dtype = hidden.device, hidden.dtype
+        batch = len(layouts)
+        question_bounds, option_bounds = [], []
+        type_ids, owner, slot, question_request, last_tokens = [], [], [], [], []
+        regions, region_offsets = [], [0]
+        token_cu, question_cu, option_cu, option_counts = [0], [0], [0], []
+        for request, (length, questions) in enumerate(zip(lengths, layouts)):
+            offset = token_cu[-1]
+            low = min(min(q.question_span[0], q.option_spans[0][0]) for q in questions)
+            high = max(
+                max(q.question_span[1], *(e for _, e in q.option_spans))
+                for q in questions
+            )
+            # Prefix row of span position p in this request's schema region.
+            base = region_offsets[-1] + request - low
+            regions.append((offset + low, offset + high))
+            request_options = 0
+            for question in questions:
+                count = len(question.option_spans)
+                question_bounds += (
+                    base + question.question_span[0],
+                    base + question.question_span[1],
+                )
+                for option_slot, (option_start, option_end) in enumerate(
+                    question.option_spans
+                ):
+                    option_bounds += (base + option_start, base + option_end)
+                    owner.append(len(type_ids))
+                    slot.append(option_slot)
+                type_ids.append(question.question_type)
+                question_request.append(request)
+                request_options += count
+            last_tokens.append(offset + length - 1)
+            token_cu.append(offset + length)
+            region_offsets.append(region_offsets[-1] + high - low)
+            question_cu.append(len(type_ids))
+            option_cu.append(option_cu[-1] + request_options)
+            option_counts.append(request_options)
+
+        num_questions = len(type_ids)
+        widest = max(len(q.option_spans) for questions in layouts for q in questions)
+        sizes = [
+            2 * num_questions,
+            len(option_bounds),
+            num_questions,
+            len(owner),
+            len(slot),
+            num_questions,
+            batch,
+            3 * (batch + 1),
+        ]
+        packed = torch.tensor(
+            question_bounds
+            + option_bounds
+            + type_ids
+            + owner
+            + slot
+            + question_request
+            + last_tokens
+            + token_cu
+            + question_cu
+            + option_cu,
+            dtype=torch.long,
+        ).to(device, non_blocking=True)
+        (
+            question_bounds_t,
+            option_bounds_t,
+            type_ids_t,
+            owner_t,
+            slot_t,
+            question_request_t,
+            last_tokens_t,
+            cu_t,
+        ) = torch.split(packed, sizes)
+        question_bounds_t = question_bounds_t.view(-1, 2)
+        option_bounds_t = option_bounds_t.view(-1, 2)
+        token_cu_t, question_cu_t, option_cu_t = (
+            cu_t.to(torch.int32).view(3, batch + 1).unbind(0)
+        )
+        token_bounds = (token_cu_t, max(lengths))
+        question_bounds_cu = (question_cu_t, max(len(q) for q in layouts))
+        option_bounds_cu = (option_cu_t, max(option_counts))
+
+        normalized = self.hidden_norm(hidden)
+        # Running sums over each schema region, after one zero row per request.
+        region_total = region_offsets[-1] + batch
+        hidden_prefix = torch.zeros(
+            region_total, normalized.shape[-1], dtype=torch.float32, device=device
+        )
+        lexical_prefix = torch.zeros(
+            region_total,
+            output_embedding_weight.shape[-1],
+            dtype=torch.float32,
+            device=device,
+        )
+        for request, (low, high) in enumerate(regions):
+            row = region_offsets[request] + request + 1
+            torch.cumsum(
+                normalized[low:high].float(),
+                dim=0,
+                out=hidden_prefix[row : row + high - low],
+            )
+            torch.cumsum(
+                output_embedding_weight[input_ids[low:high]].float(),
+                dim=0,
+                out=lexical_prefix[row : row + high - low],
+            )
+
+        def span_means(prefix: torch.Tensor, bounds: torch.Tensor) -> torch.Tensor:
+            sums = prefix[bounds[:, 1]] - prefix[bounds[:, 0]]
+            return (sums / (bounds[:, 1] - bounds[:, 0]).unsqueeze(-1)).to(dtype)
+
+        memory = self.memory_projection(normalized)
+        global_vectors = normalized[last_tokens_t]
+        question_vectors = span_means(hidden_prefix, question_bounds_t)
+        option_contexts = span_means(hidden_prefix, option_bounds_t)
+        lexical = span_means(lexical_prefix, option_bounds_t)
+
+        routed = (
+            self.option_context_projection(option_contexts)
+            + self.option_lexical_projection(lexical)
+            + self.option_question_projection(question_vectors)[owner_t]
+        )
+        for layer in self.evidence_layers:
+            routed = routed + _attention(
+                layer.attention,
+                layer.query_norm(routed),
+                layer.memory_norm(memory),
+                option_bounds_cu,
+                token_bounds,
+            )
+            routed = routed + layer.feedforward(layer.feedforward_norm(routed))
+
+        base_fields = self.question_projection(question_vectors)
+        scores = torch.matmul(
+            routed.unsqueeze(1), base_fields[owner_t].unsqueeze(2)
+        ).view(-1) / math.sqrt(routed.shape[-1])
+        padded_scores = torch.full(
+            (num_questions, widest), float("-inf"), dtype=torch.float32, device=device
+        )
+        padded_scores[owner_t, slot_t] = scores.float()
+        weights = torch.softmax(padded_scores, dim=1).to(dtype)
+        padded_options = routed.new_zeros(num_questions, widest, routed.shape[-1])
+        padded_options[owner_t, slot_t] = routed
+        summaries = torch.sum(weights.unsqueeze(-1) * padded_options, dim=1)
+        fields = (
+            base_fields
+            + self.option_summary_norm(summaries)
+            + self.global_projection(global_vectors)[question_request_t]
+            + self.type_embedding(type_ids_t)
+        )
+        for layer in self.layers:
+            fields = fields + _attention(
+                layer.self_attn,
+                layer.norm1(fields),
+                None,
+                question_bounds_cu,
+                question_bounds_cu,
+            )
+            fields = fields + _attention(
+                layer.multihead_attn,
+                layer.norm2(fields),
+                memory,
+                question_bounds_cu,
+                token_bounds,
+            )
+            fields = fields + layer.linear2(
+                layer.activation(layer.linear1(layer.norm3(fields)))
+            )
+        fields = self.field_norm(fields)
+
+        prior_scale = self.prior_logit_scale.clamp(max=math.log(100.0)).exp()
+        joint_scale = self.joint_logit_scale.clamp(max=math.log(100.0)).exp()
+        anchor = F.normalize(
+            question_vectors + global_vectors[question_request_t], dim=-1
+        )
+        prior = prior_scale * torch.matmul(
+            F.normalize(lexical, dim=-1).unsqueeze(1), anchor[owner_t].unsqueeze(2)
+        ).view(-1)
+        options = self.option_norm(routed)
+        repeated = fields[owner_t]
+        cosine = F.cosine_similarity(repeated, options, dim=-1)
+        features = torch.cat(
+            [repeated, options, repeated * options, torch.abs(repeated - options)],
+            dim=-1,
+        )
+        residual = self.residual_scorer(features).squeeze(-1)
+        logits = prior + torch.sigmoid(self.residual_gate) * (
+            joint_scale * cosine + residual
+        )
+        return list(torch.split(logits.float(), option_counts))
+
+
 def _origin_main_forward_batch(head, hidden, input_ids, lengths, layouts, lm_head):
     outputs = []
     start = 0
     for group in _groups(lengths, layouts):
         group_lengths = [lengths[i] for i in group]
         end = start + sum(group_lengths)
-        outputs += head._forward_group(
+        outputs += _OriginMainJointSchemaHead._forward_group(
+            head,
             hidden[start:end],
             input_ids[start:end],
             group_lengths,
@@ -319,17 +603,27 @@ def _origin_main_forward_batch(head, hidden, input_ids, lengths, layouts, lm_hea
 
 
 class TestJointSchemaHeadPrefixMemory(CustomTestCase):
-    def test_t1_split_prefix_matches_full_path(self):
+    def _run_t1(self, device):
         torch.manual_seed(13)
         hidden_size, vocab, length, boundary = 16, 64, 40, 8
+        input_dtype = torch.float32 if device.type == "cpu" else torch.bfloat16
         questions = _questions()
         layout = pack_decision_layout(length, questions)
-        hidden = torch.randn(length, hidden_size)
-        input_ids = torch.randint(vocab, (length,))
-        lm_head = torch.randn(vocab, hidden_size)
-        head = JointSchemaHead(
-            hidden_size, width=8, routing_layers=1, layers=1, heads=2, feedforward=16
-        ).eval()
+        hidden = torch.randn(length, hidden_size, device=device, dtype=input_dtype)
+        input_ids = torch.randint(vocab, (length,), device=device)
+        lm_head = torch.randn(vocab, hidden_size, device=device, dtype=input_dtype)
+        head = (
+            JointSchemaHead(
+                hidden_size,
+                width=8,
+                routing_layers=1,
+                layers=1,
+                heads=2,
+                feedforward=16,
+            )
+            .to(device=device, dtype=input_dtype)
+            .eval()
+        )
 
         with torch.no_grad():
             full = head.forward_batch(
@@ -344,7 +638,8 @@ class TestJointSchemaHeadPrefixMemory(CustomTestCase):
                 lm_head,
                 prefix_memory=[prefix_memory],
             )[0]
-        torch.testing.assert_close(full, split, atol=1e-5, rtol=0)
+        tolerance = 1e-5 if input_dtype == torch.float32 else 1e-2
+        torch.testing.assert_close(full, split, atol=tolerance, rtol=0)
 
         bf16_head = head.to(torch.bfloat16)
         bf16_hidden = hidden.to(torch.bfloat16)
@@ -367,18 +662,38 @@ class TestJointSchemaHeadPrefixMemory(CustomTestCase):
                 prefix_memory=[bf16_prefix],
             )[0]
         max_abs_diff = (bf16_full.float() - bf16_split.float()).abs().max().item()
-        print(f"T1 BF16 maximum absolute difference: {max_abs_diff:.8g}")
+        print(f"T1 {device} BF16 maximum absolute difference: {max_abs_diff:.8g}")
         self.assertLess(max_abs_diff, 1e-2)
 
-    def test_t2_mixed_prefix_batch_matches_full_requests(self):
+    def test_t1_split_prefix_matches_full_path(self):
+        self._run_t1(torch.device("cpu"))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is not available")
+    def test_t1_split_prefix_matches_full_path_cuda(self):
+        self._run_t1(torch.device("cuda"))
+
+    def _run_t2(self, device):
         torch.manual_seed(17)
         hidden_size, vocab, length = 16, 64, 40
-        head = JointSchemaHead(
-            hidden_size, width=8, routing_layers=1, layers=1, heads=2, feedforward=16
-        ).eval()
-        lm_head = torch.randn(vocab, hidden_size)
-        full_hidden = [torch.randn(length, hidden_size) for _ in range(3)]
-        full_ids = [torch.randint(vocab, (length,)) for _ in range(3)]
+        input_dtype = torch.float32 if device.type == "cpu" else torch.bfloat16
+        head = (
+            JointSchemaHead(
+                hidden_size,
+                width=8,
+                routing_layers=1,
+                layers=1,
+                heads=2,
+                feedforward=16,
+            )
+            .to(device=device, dtype=input_dtype)
+            .eval()
+        )
+        lm_head = torch.randn(vocab, hidden_size, device=device, dtype=input_dtype)
+        full_hidden = [
+            torch.randn(length, hidden_size, device=device, dtype=input_dtype)
+            for _ in range(3)
+        ]
+        full_ids = [torch.randint(vocab, (length,), device=device) for _ in range(3)]
         questions = [_questions() for _ in range(3)]
         boundaries = [0, 5, 8]
 
@@ -408,8 +723,18 @@ class TestJointSchemaHeadPrefixMemory(CustomTestCase):
             )
         for expected_logits, actual_logits in zip(expected, actual):
             torch.testing.assert_close(
-                actual_logits, expected_logits, atol=1e-5, rtol=0
+                actual_logits,
+                expected_logits,
+                atol=1e-5 if input_dtype == torch.float32 else 1e-2,
+                rtol=0,
             )
+
+    def test_t2_mixed_prefix_batch_matches_full_requests(self):
+        self._run_t2(torch.device("cpu"))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is not available")
+    def test_t2_mixed_prefix_batch_matches_full_requests_cuda(self):
+        self._run_t2(torch.device("cuda"))
 
     def test_t3_no_prefix_is_equal_to_origin_main_forward_batch(self):
         torch.manual_seed(19)
@@ -424,9 +749,15 @@ class TestJointSchemaHeadPrefixMemory(CustomTestCase):
         lm_head = torch.randn(vocab, hidden_size)
         with torch.no_grad():
             actual = head.forward_batch(hidden, input_ids, lengths, layouts, lm_head)
-            expected = _origin_main_forward_batch(
-                head, hidden, input_ids, lengths, layouts, lm_head
-            )
+            if hidden.device.type == "cpu":
+                with patch(__name__ + "._attention", _cpu_attention):
+                    expected = _origin_main_forward_batch(
+                        head, hidden, input_ids, lengths, layouts, lm_head
+                    )
+            else:
+                expected = _origin_main_forward_batch(
+                    head, hidden, input_ids, lengths, layouts, lm_head
+                )
         for actual_logits, expected_logits in zip(actual, expected):
             self.assertTrue(torch.equal(actual_logits, expected_logits))
 
