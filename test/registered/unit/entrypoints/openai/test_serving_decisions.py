@@ -1064,6 +1064,23 @@ class TestSystemOne(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(refused.status_code, 400)
 
+    async def test_usage_reports_the_cached_prefix_tokens(self):
+        manager = ScoringManager(self.tokenizer)
+        manager.cached_tokens = 8
+        request = _systemone_request(
+            {"urgent": {"type": "noul", "instructions": "Urgent?"}}
+        )
+        response = await self._serving(manager).handle_request(request, None)
+        self.assertEqual(response.status_code, 200)
+        usage = json.loads(response.body)["usage"]
+        self.assertEqual(
+            usage["input_tokens_details"]["cached_tokens"],
+            8 * len(manager.requests[0].input_ids),
+        )
+        self.assertLess(
+            usage["input_tokens_details"]["cached_tokens"], usage["input_tokens"]
+        )
+
     async def test_answers_follow_the_published_shapes(self):
         manager = ScoringManager(self.tokenizer)
         legend_level = {"label": "Angry", "examples": ["caps"]}
@@ -1086,7 +1103,12 @@ class TestSystemOne(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(list(body["answers"]), ["urgent", "team", "mood"])
         prompt_tokens = sum(len(ids) for ids in manager.requests[0].input_ids)
         self.assertEqual(
-            body["usage"], {"input_tokens": prompt_tokens, "output_tokens": 0}
+            body["usage"],
+            {
+                "input_tokens": prompt_tokens,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens": 0,
+            },
         )
 
         urgent = body["answers"]["urgent"]

@@ -36,6 +36,7 @@ from sglang.srt.entrypoints.systemone.joint_schema import (
 from sglang.srt.entrypoints.systemone.protocol import (
     SystemOneChoiceAnswer,
     SystemOneChoiceQuestion,
+    SystemOneInputTokensDetails,
     SystemOneNoulAnswer,
     SystemOneNoulQuestion,
     SystemOneQuestion,
@@ -228,7 +229,12 @@ class SystemOneServing(OpenAIServingDecisions):
         response = SystemOneResponse(
             model=self.tokenizer_manager.served_model_name,
             answers=answers,
-            usage=SystemOneUsage(input_tokens=ret["meta_info"]["prompt_tokens"]),
+            usage=SystemOneUsage(
+                input_tokens=ret["meta_info"]["prompt_tokens"],
+                input_tokens_details=SystemOneInputTokensDetails(
+                    cached_tokens=ret["meta_info"].get("cached_tokens", 0)
+                ),
+            ),
         )
         # The head scores only the allowed options, so there is no label mass.
         return ORJSONResponse(
@@ -364,7 +370,12 @@ class SystemOneServing(OpenAIServingDecisions):
             # The served model answered, whatever name the request used.
             model=self.tokenizer_manager.served_model_name,
             answers=answers,
-            usage=SystemOneUsage(input_tokens=result.prompt_tokens),
+            usage=SystemOneUsage(
+                input_tokens=result.prompt_tokens,
+                input_tokens_details=SystemOneInputTokensDetails(
+                    cached_tokens=result.cached_tokens
+                ),
+            ),
         )
         # A decision checkpoint's readout has no full-vocabulary distribution.
         exclude = (

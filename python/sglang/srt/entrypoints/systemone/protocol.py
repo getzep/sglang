@@ -140,8 +140,14 @@ class SystemOneScoreAnswer(BaseModel):
     x_label_mass: float
 
 
+class SystemOneInputTokensDetails(BaseModel):
+    # Prompt tokens that the prefix cache served, so the server did not compute them.
+    cached_tokens: NonNegativeInt = 0
+
+
 class SystemOneUsage(BaseModel):
     input_tokens: NonNegativeInt
+    input_tokens_details: SystemOneInputTokensDetails = SystemOneInputTokensDetails()
     output_tokens: NonNegativeInt = 0
 
 
