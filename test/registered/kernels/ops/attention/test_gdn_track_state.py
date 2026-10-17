@@ -139,6 +139,56 @@ class TestGdnTrackState(CustomTestCase):
                 h_err = (h_row - ref_state[0]).abs().max()
                 self.assertLess(snapshot_err.item(), h_err.item())
 
+    @torch.inference_mode()
+    def test_suffix_from_snapshot_matches_the_full_run(self):
+        """A prefix-cache hit runs the suffix tokens from the snapshot state.
+        Their outputs must match the same tokens of one full run within bf16
+        rounding (the chunk grid is the same, so only the accumulation order
+        can differ)."""
+        if not torch.cuda.is_available():
+            self.skipTest("requires CUDA")
+        lens = [2816 + 135]
+        chunk = 44  # 2816 tokens, the Clef cache boundary of the spike prompt
+        q, k, v, g, beta, state, cu_seqlens = _make_varlen_inputs(1, lens)
+        num_heads, head_dim = q.shape[2], q.shape[3]
+        track_state = torch.zeros(
+            1, num_heads, head_dim, head_dim, device="cuda", dtype=torch.float32
+        )
+        track_chunk_idx = torch.tensor([chunk], dtype=torch.int32, device="cuda")
+        o_full, _, _ = _run(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            state.clone(),
+            cu_seqlens,
+            track_state=track_state,
+            track_chunk_idx=track_chunk_idx,
+        )
+        lo = chunk * CHUNK_SIZE
+        suffix_cu_seqlens = torch.tensor(
+            [0, lens[0] - lo], dtype=torch.int32, device="cuda"
+        )
+        o_suffix, _, _ = _run(
+            q[:, lo:],
+            k[:, lo:],
+            v[:, lo:],
+            g[:, lo:],
+            beta[:, lo:],
+            track_state.clone(),
+            suffix_cu_seqlens,
+        )
+        diff = (o_full[:, lo:].float() - o_suffix.float()).abs()
+        scale = o_full[:, lo:].float().abs().max()
+        print(
+            f"suffix-from-snapshot: max abs diff {diff.max().item():.3e}, "
+            f"mean abs diff {diff.mean().item():.3e}, output scale {scale.item():.3e}"
+        )
+        torch.testing.assert_close(
+            o_suffix.float(), o_full[:, lo:].float(), rtol=2**-6, atol=2**-6 * scale
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
