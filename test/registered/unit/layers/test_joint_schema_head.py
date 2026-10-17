@@ -861,6 +861,12 @@ class TestJointSchemaHeadPrefixMemory(CustomTestCase):
         layout = pack_decision_layout(100, [LayoutQuestion(0, (20, 22), ((25, 27),))])
         self.assertEqual(compute_clef_cache_boundary(layout, 100, 4, 8), 16)
         self.assertEqual(compute_clef_cache_boundary(layout, 110, 4, 8), 24)
+        self.assertEqual(
+            compute_clef_cache_boundary(layout, 100, 4, 8, schema_start=12), 8
+        )
+        self.assertEqual(
+            compute_clef_cache_boundary(layout, 110, 4, 8, schema_start=12), 16
+        )
 
         pool = SimpleNamespace(
             store_clef_memory=lambda locations, rows: None,

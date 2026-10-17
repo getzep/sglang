@@ -66,8 +66,11 @@ def encode_joint_schema(
     request: SystemOneRequest,
     max_length: int,
     image_token_counts: Sequence[int],
-) -> Tuple[List[int], List[int]]:
-    """The prompt ids and their decision layout.
+) -> Tuple[List[int], List[int], int]:
+    """The prompt ids, their decision layout, and the schema start.
+
+    The schema start is the position of the ``SCHEMA FIELDS`` header: the
+    first token that differs between two prompts with the same state.
 
     Each image's placeholder expands to its count in ``image_token_counts``, and
     the state is truncated so that the expanded prompt has at most
@@ -134,4 +137,4 @@ def encode_joint_schema(
             for question_type, question_span, option_spans in questions
         ],
     )
-    return input_ids, layout
+    return input_ids, layout, offset

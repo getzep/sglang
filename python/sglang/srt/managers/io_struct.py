@@ -1283,6 +1283,9 @@ class EmbeddingReqInput:
     # scores, as packed by layers.joint_schema_head.pack_decision_layout.
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     decision_layout: Optional[Union[List[List[int]], List[int]]] = None
+    # Position of the schema block in the prompt. The Clef prefix cache
+    # ends its reusable prefix before it. Batch-level: List[int].
+    clef_schema_start: Optional[Union[List[int], int]] = None
 
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
@@ -1505,6 +1508,11 @@ class EmbeddingReqInput:
                     if self.decision_layout is not None
                     else None
                 ),
+                clef_schema_start=(
+                    self.clef_schema_start[i]
+                    if self.clef_schema_start is not None
+                    else None
+                ),
             )
         cache[i] = sub
         return sub
@@ -1538,6 +1546,8 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     token_indices_to_pool: Optional[List[int]] = None
     # Question and option spans for a joint schema head
     decision_layout: Optional[List[int]] = None
+    # Position of the schema block, before which the Clef prefix cache may reuse
+    clef_schema_start: Optional[int] = None
     # For observability
     # Pickled Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None

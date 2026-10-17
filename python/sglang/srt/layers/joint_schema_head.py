@@ -133,9 +133,19 @@ def compute_clef_cache_boundary(
     expanded_prompt_length: int,
     page_size: int,
     mamba_cache_chunk_size: int,
+    schema_start: Optional[int] = None,
 ) -> int:
+    """The length of the prompt prefix that a cached request may reuse.
+
+    ``schema_start`` is the position of the schema block before the images
+    expand. Two prompts with the same state first differ there (the question
+    ids), so the boundary ends before it. Without it the boundary ends before
+    the first question or option span, which can sit past that point.
+    """
     questions = parse_decision_layout(layout, expanded_prompt_length)
     span_starts = [question.question_span[0] for question in questions]
+    if schema_start is not None:
+        span_starts.append(schema_start + expanded_prompt_length - layout[0])
     span_starts.extend(
         start for question in questions for start, _ in question.option_spans
     )

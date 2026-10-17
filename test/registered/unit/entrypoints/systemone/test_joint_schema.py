@@ -174,7 +174,7 @@ class TestJointSchemaPrompt(unittest.TestCase):
         cls.tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
 
     def _encode(self, request=REQUEST, max_length=4096):
-        input_ids, layout = encode_joint_schema(
+        input_ids, layout, _ = encode_joint_schema(
             self.tokenizer,
             SystemOneRequest(**request),
             max_length=max_length,
@@ -205,6 +205,33 @@ class TestJointSchemaPrompt(unittest.TestCase):
                 "JOINT SCHEMA DECISIONS:"
             )
         )
+
+    def test_schema_start_is_where_prompts_with_one_state_first_differ(self):
+        renamed = dict(REQUEST)
+        renamed["questions"] = {
+            f"{key}_b": value for key, value in REQUEST["questions"].items()
+        }
+        ids = []
+        starts = []
+        for request in (REQUEST, renamed):
+            input_ids, _, start = encode_joint_schema(
+                self.tokenizer,
+                SystemOneRequest(**request),
+                max_length=4096,
+                image_token_counts=[],
+            )
+            ids.append(input_ids)
+            starts.append(start)
+        self.assertEqual(starts[0], starts[1])
+        start = starts[0]
+        self.assertEqual(ids[0][:start], ids[1][:start])
+        self.assertTrue(
+            self.tokenizer.decode(ids[0][:start]).endswith('"Refund for order 1182"}')
+        )
+        self.assertTrue(
+            self.tokenizer.decode(ids[0][start:]).startswith("\n\nSCHEMA FIELDS:")
+        )
+        self.assertNotEqual(ids[0], ids[1])
 
     def test_layout_spans_hold_questions_and_options_in_head_order(self):
         input_ids, questions = self._encode()
@@ -256,7 +283,7 @@ class TestJointSchemaPrompt(unittest.TestCase):
 
     def test_image_placeholders_precede_the_state(self):
         request = {**REQUEST, "images": ["data:image/png;base64,AAAA"]}
-        input_ids, layout = encode_joint_schema(
+        input_ids, layout, _ = encode_joint_schema(
             self.tokenizer,
             SystemOneRequest(**request),
             max_length=4096,
@@ -289,7 +316,7 @@ class TestJointSchemaAnswers(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(response.status_code, 200)
         body = json.loads(response.body)
-        input_ids, layout = encode_joint_schema(
+        input_ids, layout, _ = encode_joint_schema(
             self.tokenizer,
             SystemOneRequest(**REQUEST),
             max_length=4089,

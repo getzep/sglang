@@ -161,7 +161,7 @@ class SystemOneServing(OpenAIServingDecisions):
             adapted_request.image_data, image_token_counts = await self._read_images(
                 adapted_request.image_data
             )
-        input_ids, layout = encode_joint_schema(
+        input_ids, layout, schema_start = encode_joint_schema(
             tokenizer_manager.tokenizer,
             request,
             max_length=max_length,
@@ -169,6 +169,7 @@ class SystemOneServing(OpenAIServingDecisions):
         )
         adapted_request.input_ids = input_ids
         adapted_request.decision_layout = layout
+        adapted_request.clef_schema_start = schema_start
 
     async def _read_images(
         self, images: List[ImageData]

@@ -1669,6 +1669,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
                 token_indices_to_pool=obj.token_indices_to_pool,
                 decision_layout=obj.decision_layout,
+                clef_schema_start=obj.clef_schema_start,
             )
 
         tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats
