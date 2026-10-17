@@ -34,6 +34,7 @@ PooledHiddenStateOutput: TypeAlias = Union[
 class ScoreResult:
     scores: ScoreOutput
     prompt_tokens: int = 0
+    cached_tokens: int = 0
     # Pre-head CPU tensors parallel to scores; kept as tensors so in-process
     # consumers avoid a .tolist() round-trip (the HTTP path converts before JSON).
     pooled_hidden_states: Optional[PooledHiddenStateOutput] = None
@@ -367,6 +368,7 @@ class TokenizerManagerScoreMixin:
         phs_list = []
         has_phs = False
         prompt_tokens = 0
+        cached_tokens = 0
         token_logprobs = [] if return_token_logprobs else None
 
         is_generation = self.is_generation
@@ -374,6 +376,7 @@ class TokenizerManagerScoreMixin:
             for result, labels in zip(results, label_token_ids):
                 meta = result["meta_info"]
                 prompt_tokens += meta.get("prompt_tokens", 0)
+                cached_tokens += meta.get("cached_tokens", 0)
 
                 if per_item_matrix:
                     # Setwise: label-token logprobs were read AT each anchor
@@ -417,7 +420,9 @@ class TokenizerManagerScoreMixin:
                 if embedding is None:
                     raise ValueError("Embedding not found in the result.")
 
-                prompt_tokens += result.get("meta_info", {}).get("prompt_tokens", 0)
+                meta = result.get("meta_info", {})
+                prompt_tokens += meta.get("prompt_tokens", 0)
+                cached_tokens += meta.get("cached_tokens", 0)
 
                 if per_item_matrix:
                     rows = self._multi_position_score_rows(embedding, apply_softmax)
@@ -446,6 +451,7 @@ class TokenizerManagerScoreMixin:
         return ScoreResult(
             scores=scores,
             prompt_tokens=prompt_tokens,
+            cached_tokens=cached_tokens,
             pooled_hidden_states=phs_list if has_phs else None,
             token_logprobs=token_logprobs,
         )

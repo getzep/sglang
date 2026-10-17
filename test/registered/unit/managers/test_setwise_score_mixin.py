@@ -57,9 +57,13 @@ class _GenHarness(TokenizerManagerScoreMixin):
 
 class TestSingleItemScoringResults(CustomTestCase):
     @staticmethod
-    def _result(embedding, phs=None, prompt_tokens=7):
+    def _result(embedding, phs=None, prompt_tokens=7, cached_tokens=0):
         r = {
-            "meta_info": {"id": "rid-1", "prompt_tokens": prompt_tokens},
+            "meta_info": {
+                "id": "rid-1",
+                "prompt_tokens": prompt_tokens,
+                "cached_tokens": cached_tokens,
+            },
             "embedding": embedding,
         }
         if phs is not None:
@@ -97,6 +101,19 @@ class TestSingleItemScoringResults(CustomTestCase):
         self.assertIsInstance(res, ScoreResult)
         self.assertEqual(res.scores, [[0.1, 0.2], [0.3, 0.4]])
         self.assertEqual(res.prompt_tokens, 14)
+        self.assertEqual(res.cached_tokens, 0)
+
+    def test_pointwise_sums_cached_tokens_over_items(self):
+        results = [
+            self._result([0.1, 0.2], cached_tokens=5),
+            self._result([0.3, 0.4], cached_tokens=0),
+            {"meta_info": {"id": "rid-3", "prompt_tokens": 7}, "embedding": [0.5, 0.6]},
+        ]
+        res = self.h._process_single_item_scoring_results(
+            results, label_token_ids=None, apply_softmax=False
+        )
+        self.assertEqual(res.prompt_tokens, 21)
+        self.assertEqual(res.cached_tokens, 5)
 
     def test_mis_pooled_hidden_states_are_list_of_item_tensors(self):
         # Standard MIS returns one fused result with a row at each delimiter.

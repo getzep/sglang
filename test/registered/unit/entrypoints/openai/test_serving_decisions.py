@@ -184,6 +184,7 @@ class ScoringManager(TokenizerManagerScoreMixin):
         self.logprobs = torch.log_softmax(logits * 4, dim=0)
         self.requests = []
         self.served_model_name = "served-model"
+        self.cached_tokens = 0
 
     def config_value(self, name):
         return None
@@ -194,7 +195,11 @@ class ScoringManager(TokenizerManagerScoreMixin):
         results = []
         for ids, labels in zip(request.input_ids, request.token_ids_logprob):
             logprobs = [(self.logprobs[token].item(), token, None) for token in labels]
-            meta = {"prompt_tokens": len(ids), "output_token_ids_logprobs": [logprobs]}
+            meta = {
+                "prompt_tokens": len(ids),
+                "cached_tokens": self.cached_tokens,
+                "output_token_ids_logprobs": [logprobs],
+            }
             results.append({"meta_info": meta})
         yield results
 
@@ -526,6 +531,7 @@ class TestDecisions(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["usage"]["prompt_tokens"], prompt_tokens)
         self.assertEqual(body["usage"]["total_tokens"], prompt_tokens)
         self.assertEqual(body["usage"]["completion_tokens"], 0)
+        self.assertEqual(body["usage"]["prompt_tokens_details"]["cached_tokens"], 0)
         cases = {
             "department": (["billing", "technical", "sales"], ["A", "B", "C"]),
             "frustration": (["0", "1", "2"], ["0", "1", "2"]),
@@ -566,6 +572,30 @@ class TestDecisions(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             set(body["answers"]["is_urgent"]),
             {"type", "probabilities", "label_mass"},
+        )
+
+    async def test_usage_reports_the_cached_prefix_tokens(self):
+        """A prefix-cache hit on any scored prompt shows up in usage."""
+        manager = ScoringManager(self.tokenizer)
+        manager.cached_tokens = 8
+        request = _request(
+            "The integration keeps failing and I am losing sales.",
+            {
+                "department": _question("choice", {"billing": None, "sales": None}),
+                "is_urgent": _question("yes_no"),
+            },
+            prompt_format_version=PROMPT_FORMAT_VERSION,
+        )
+        response = await _handler(manager).handle_request(request, None)
+        body = json.loads(response.body)
+        self.assertEqual(len(manager.requests), 1)
+        self.assertEqual(
+            body["usage"]["prompt_tokens_details"]["cached_tokens"],
+            8 * len(manager.requests[0].input_ids),
+        )
+        self.assertLess(
+            body["usage"]["prompt_tokens_details"]["cached_tokens"],
+            body["usage"]["prompt_tokens"],
         )
 
     async def test_returned_ids_are_the_scored_ids(self):

@@ -21,6 +21,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     DecisionResponse,
     DecisionScoreQuestion,
     DecisionText,
+    PromptTokensDetails,
     UsageInfo,
     is_blank_decision_text,
 )
@@ -442,6 +443,9 @@ class OpenAIServingDecisions(OpenAIServingBase):
             usage=UsageInfo(
                 prompt_tokens=result.prompt_tokens,
                 total_tokens=result.prompt_tokens,
+                prompt_tokens_details=PromptTokensDetails(
+                    cached_tokens=result.cached_tokens
+                ),
             ),
         )
         return ORJSONResponse(content=response.model_dump(exclude_none=True))
